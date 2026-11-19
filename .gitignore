@@ -1,0 +1,16 @@
+# Local Arduino/OpenCode files
+sketch_may4a/.theia/
+sketch_may4a/backup/
+*.bak
+
+# Arduino build output
+build/
+*.bin
+*.elf
+*.map
+*.hex
+
+# OS/editor files
+.DS_Store
+Thumbs.db
+desktop.ini
