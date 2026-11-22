@@ -3,6 +3,15 @@ sketch_may4a/.theia/
 sketch_may4a/backup/
 *.bak
 
+# Private configuration, credentials, local executables and test output
+sketch_may4a/LocalConfig.h
+private/
+.local/
+__pycache__/
+*.pyc
+*.obj
+*.exe
+
 # Arduino build output
 build/
 *.bin

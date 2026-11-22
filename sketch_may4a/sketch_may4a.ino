@@ -1,15 +1,15 @@
 /*
   OTL PC Tuner - ESP32 Bluetooth speaker and sound-reactive 8x8 matrix
 
-  Audio hardware uses both ESP32 I2S controllers so input and output can run
-  at the same time:
+  Bluetooth audio uses one ESP32 I2S controller:
     I2S0 TX -> MAX98357A: BCLK=26, LRC=25, DIN=22
-    I2S1 RX <- I2S mic:   BCLK=33, WS=32,  SD=35 (left channel)
 
   Bluetooth Classic A2DP carries music to the speaker. BLE remains available
-  for light controls by starting the radio in BTDM (Classic + BLE) mode.
+  for readable light/audio commands in BTDM (Classic + BLE) mode.
+  Wi-Fi serves lightweight, no-login controls with the same command grammar.
   Music modes analyze the decoded A2DP PCM that is actually sent to the amp;
-  when Bluetooth audio is paused, they automatically fall back to the mic.
+  without fresh Bluetooth PCM, music effects go dark. No external audio input
+  or I2S1 receive driver is initialized.
 */
 
 #include <Arduino.h>
@@ -20,10 +20,15 @@
 #include "AudioTools.h"
 #include "BluetoothA2DPSink.h"
 
-#include <BLEDevice.h>
-#include <BLEServer.h>
-#include <BLEUtils.h>
-#include <BLE2902.h>
+#include "BleControl.h"
+#include <atomic>
+#include <stdarg.h>
+#include <esp32/rom/ets_sys.h>
+#include "ControlBridge.h"
+#include "IrControl.h"
+#include "AudioSelection.h"
+#include "WebControl.h"
+#include "RuntimeResources.h"
 
 // ------------------------------- Hardware ---------------------------------
 
@@ -43,96 +48,37 @@ constexpr int SPEAKER_BCLK_PIN = 26;
 constexpr int SPEAKER_WS_PIN = 25;
 constexpr int SPEAKER_DATA_PIN = 22;
 
-constexpr int MIC_I2S_PORT = 1;
-constexpr int MIC_BCLK_PIN = 33;
-constexpr int MIC_WS_PIN = 32;
-constexpr int MIC_DATA_PIN = 35;
-constexpr uint32_t MIC_SAMPLE_RATE = 32000;
-
 constexpr char BLUETOOTH_NAME[] = "OTL PC Tuner";
+constexpr char BLE_CONTROL_NAME[] = "OTL PC Tuner BLE";
 
 // Nordic UART Service used by the existing phone controller.
 constexpr char SERVICE_UUID[] = "6E400001-B5A3-F393-E0A9-E50E24DCCA9E";
 constexpr char RX_UUID[] = "6E400002-B5A3-F393-E0A9-E50E24DCCA9E";
 constexpr char TX_UUID[] = "6E400003-B5A3-F393-E0A9-E50E24DCCA9E";
 
-// ----------------------------- IR commands --------------------------------
-
-#define BTN_ON          0x40
-#define BTN_OFF         0x41
-#define BTN_V_DOWN      0x5D
-#define BTN_V_UP        0x5C
-#define BTN_W           0x44
-#define BTN_B           0x45
-#define BTN_G           0x59
-#define BTN_R           0x58
-#define BTN_PINK_1      0x48
-#define BTN_PINK_2      0x4C
-#define BTN_CYAN_1      0x1F
-#define BTN_CYAN_2      0x1B
-#define BTN_BLUE_2      0x49
-#define BTN_PURPLE_1    0x4D
-#define BTN_PURPLE_2    0x1E
-#define BTN_PURPLE_3    0x1A
-#define BTN_ORANGE_1    0x54
-#define BTN_ORANGE_2    0x50
-#define BTN_ORANGE_3    0x1C
-#define BTN_YELLOW      0x18
-#define BTN_LT_GREEN_1  0x55
-#define BTN_LT_BLUE_1   0x51
-#define BTN_LT_BLUE_2   0x1D
-#define BTN_GREEN_BLUE  0x19
-#define BTN_FLASH       0x0A
-#define BTN_1H          0x14
-#define BTN_2H          0x10
-#define BTN_3H          0x0C
-#define BTN_4H          0x08
-#define BTN_DIM_1       0x17
-#define BTN_DIM_2       0x13
-#define BTN_DIM_3       0x0F
-#define BTN_DIM_4       0x0B
-#define BTN_JUMP3       0x15
-#define BTN_JUMP7       0x11
-#define BTN_FADE3       0x0D
-#define BTN_FADE7       0x09
-#define BTN_S4          0x07
-#define BTN_S3          0x06
-#define BTN_S2          0x05
-#define BTN_S1          0x04
-
-enum LightMode : uint8_t {
-  MODE_STATIC = 1,
-  MODE_RAINBOW = 5,
-  MODE_BLINK = 6,
-  MODE_COLOR_BLEND = 7,
-  MODE_FADE_3 = 8,
-  MODE_FADE_7 = 9,
-  MODE_AUDIO_SPARKLE = 10,
-  MODE_AUDIO_PULSE = 11,
-  MODE_AUDIO_WAVE = 12,
-  MODE_AUDIO_SPECTRUM = 13
-};
-
 // ------------------------------ Peripherals --------------------------------
 
 Adafruit_NeoPixel strip(PIXEL_COUNT, LED_PIN, NEO_GRB + NEO_KHZ800);
 
 I2SStream speakerOutput;
-I2SStream microphoneInput;
 BluetoothA2DPSink a2dpSink(speakerOutput);
 
-BLEServer *bleServer = nullptr;
-BLECharacteristic *bleTxCharacteristic = nullptr;
-volatile bool bleConnected = false;
-volatile char pendingBleCommand = '\0';
+std::atomic<bool> bluetoothConnected{false};
+std::atomic<bool> bluetoothPlaying{false};
+std::atomic<bool> bluetoothTransportAvailable{false};
+std::atomic<int> pendingRemoteVolume{-1};
+QueueHandle_t transportQueue = nullptr;
+bool speakerReady = false;
+bool transportTaskReady = false;
+bool firmwareReady = false;
+size_t bleHelpLine = CONTROL_HELP_COUNT;
 
 // ----------------------------- Light state ---------------------------------
 
-uint8_t brightness = 192;
-uint8_t currentLightMode = MODE_RAINBOW;
-uint8_t savedLightMode = MODE_RAINBOW;
-bool lightsOff = false;
-uint32_t staticColor = 0;
+ControlState controls;
+uint8_t &brightness = controls.brightness;
+uint8_t &currentLightMode = controls.mode;
+uint32_t controlRevision = 0;
 
 uint32_t animationTimestamp = 0;
 uint8_t animationPhase = 0;
@@ -155,26 +101,25 @@ struct DisplayAudioLevels {
   float mid;
   float treble;
   float beat;
-  bool fromBluetooth;
+  bool active;
 };
+
+// Keep this macro after the sketch's types: Arduino inserts generated function
+// prototypes at the first function, including the function inside this macro.
+SET_LOOP_TASK_STACK_SIZE(runtime_resources::LOOP_STACK_BYTES);
 
 portMUX_TYPE audioMux = portMUX_INITIALIZER_UNLOCKED;
 RawAudioLevels bluetoothLevels = {};
-RawAudioLevels microphoneLevels = {};
 DisplayAudioLevels displayAudio = {};
+float spectrumHeights[MATRIX_WIDTH] = {};
 
-int32_t microphoneBuffer[256];
-bool microphoneReady = false;
-
-float audioNoiseFloor = 0.0f;
 float audioDynamicRange = 1.0f;
 float audioFastEnvelope = 0.0f;
 float audioSlowEnvelope = 0.0f;
-float audioSensitivity = 1.0f;
+float &audioSensitivity = controls.sensitivity;
 uint32_t lastAudioSequence = 0;
 uint32_t lastBeatMs = 0;
-bool lastAudioSourceWasBluetooth = false;
-bool audioSourceInitialized = false;
+bool audioMeterInitialized = false;
 
 // ----------------------------- Small helpers -------------------------------
 
@@ -232,32 +177,13 @@ void fadeExistingPixels(uint8_t amount) {
   }
 }
 
-void setBrightnessValue(int value) {
-  brightness = static_cast<uint8_t>(constrain(value, 15, 255));
+void applyLightState() {
   strip.setBrightness(brightness);
+  if (!controls.lightsOn || brightness == 0) strip.clear();
+  else if (currentLightMode == MODE_STATIC) strip.fill(controls.color);
+  else strip.clear();
+  animationTimestamp = 0;
   strip.show();
-}
-
-void setStaticColor(uint32_t color) {
-  staticColor = color;
-  currentLightMode = MODE_STATIC;
-  if (!lightsOff) fillStrip(staticColor);
-}
-
-void setLightsPower(bool enabled) {
-  if (enabled) {
-    if (!lightsOff) return;
-    lightsOff = false;
-    currentLightMode = savedLightMode;
-    strip.setBrightness(brightness);
-    if (currentLightMode == MODE_STATIC) fillStrip(staticColor);
-    animationTimestamp = 0;
-  } else {
-    if (lightsOff) return;
-    savedLightMode = currentLightMode;
-    lightsOff = true;
-    fillStrip(0);
-  }
 }
 
 // ----------------------------- Audio capture -------------------------------
@@ -345,46 +271,28 @@ void onBluetoothAudio(const uint8_t *data, uint32_t length) {
   portEXIT_CRITICAL(&audioMux);
 }
 
-void readMicrophone() {
-  if (!microphoneReady) return;
-
-  const size_t bytesRead = microphoneInput.readBytes(
-      reinterpret_cast<uint8_t *>(microphoneBuffer), sizeof(microphoneBuffer));
-  const size_t sampleCount = bytesRead / sizeof(microphoneBuffer[0]);
-  if (sampleCount == 0) return;
-
-  // Standard I2S microphones place their 24-bit sample in a 32-bit word.
-  // Shift to a manageable signed range while retaining useful resolution.
-  for (size_t index = 0; index < sampleCount; ++index) {
-    microphoneBuffer[index] >>= 8;
-  }
-
-  static int32_t lowState = 0;
-  static int32_t midState = 0;
-  static uint32_t sequence = 0;
-  microphoneLevels = analyzeMonoSamples(microphoneBuffer, sampleCount, lowState,
-                                        midState, ++sequence, millis());
-}
-
-RawAudioLevels latestAudioLevels(bool &fromBluetooth) {
+RawAudioLevels latestAudioLevels() {
   RawAudioLevels bluetoothCopy;
   portENTER_CRITICAL(&audioMux);
   bluetoothCopy = bluetoothLevels;
   portEXIT_CRITICAL(&audioMux);
 
-  const uint32_t now = millis();
-  fromBluetooth = bluetoothCopy.timestampMs != 0U &&
-                  static_cast<uint32_t>(now - bluetoothCopy.timestampMs) < 300U;
-  return fromBluetooth ? bluetoothCopy : microphoneLevels;
+  if (!hasFreshBluetoothAudio(millis(), bluetoothCopy.sequence, bluetoothCopy.timestampMs))
+    return RawAudioLevels{};
+  return bluetoothCopy;
 }
 
 void updateDisplayAudio() {
-  bool fromBluetooth = false;
-  const RawAudioLevels raw = latestAudioLevels(fromBluetooth);
-
-  if (raw.sequence == 0U ||
-      (raw.sequence == lastAudioSequence &&
-       fromBluetooth == lastAudioSourceWasBluetooth)) {
+  const RawAudioLevels raw = latestAudioLevels();
+  if (raw.sequence == 0U) {
+    displayAudio = {};
+    memset(spectrumHeights, 0, sizeof(spectrumHeights));
+    audioMeterInitialized = false;
+    lastAudioSequence = 0;
+    return;
+  }
+  displayAudio.active = true;
+  if (raw.sequence == lastAudioSequence) {
     displayAudio.overall *= 0.92f;
     displayAudio.bass *= 0.91f;
     displayAudio.mid *= 0.91f;
@@ -393,37 +301,19 @@ void updateDisplayAudio() {
     return;
   }
 
-  if (!audioSourceInitialized ||
-      fromBluetooth != lastAudioSourceWasBluetooth) {
-    audioNoiseFloor = fromBluetooth ? 0.0f : raw.average * 0.55f;
+  if (!audioMeterInitialized) {
     audioDynamicRange = raw.average > 1U ? raw.average * 0.45f : 1.0f;
     audioFastEnvelope = 0.0f;
     audioSlowEnvelope = 0.0f;
     displayAudio = {};
-    audioSourceInitialized = true;
+    audioMeterInitialized = true;
   }
 
-  lastAudioSourceWasBluetooth = fromBluetooth;
   lastAudioSequence = raw.sequence;
-  displayAudio.fromBluetooth = fromBluetooth;
+  displayAudio.active = true;
 
-  const float average = static_cast<float>(raw.average);
-  if (fromBluetooth) {
-    audioNoiseFloor = 0.0f;
-  } else if (average < audioNoiseFloor) {
-    audioNoiseFloor += (average - audioNoiseFloor) * 0.12f;
-  } else if (average < audioNoiseFloor * 1.5f + 1.0f) {
-    audioNoiseFloor += (average - audioNoiseFloor) * 0.004f;
-  } else {
-    // Do not let sustained music rapidly become the microphone noise floor.
-    audioNoiseFloor += (average - audioNoiseFloor) * 0.0002f;
-  }
-
-  float signal = average - audioNoiseFloor * (fromBluetooth ? 1.0f : 1.08f);
-  if (signal < 0.0f) signal = 0.0f;
-
-  const float minimumRange =
-      fromBluetooth ? 180.0f : (audioNoiseFloor * 0.10f + 100.0f);
+  const float signal = static_cast<float>(raw.average);
+  constexpr float minimumRange = 180.0f;
   audioDynamicRange *= 0.992f;
   if (audioDynamicRange < minimumRange) audioDynamicRange = minimumRange;
   if (signal > audioDynamicRange) audioDynamicRange = signal;
@@ -508,6 +398,7 @@ void renderFade(bool sevenColors) {
       strip.Color(255, 0, 255), strip.Color(0, 255, 255),
       strip.Color(255, 255, 255)};
   const uint8_t colorCount = sevenColors ? 7U : 3U;
+  colorIndex %= colorCount;
 
   int nextValue = static_cast<int>(fadeValue) + fadeDirection;
   if (nextValue >= 255) {
@@ -528,7 +419,7 @@ void renderFade(bool sevenColors) {
 void renderAudioSparkle() {
   fadeExistingPixels(188);
   const uint8_t sparkCount =
-      1U + static_cast<uint8_t>(displayAudio.overall * 9.0f);
+      static_cast<uint8_t>(displayAudio.overall * 10.0f);
   for (uint8_t spark = 0; spark < sparkCount; ++spark) {
     const uint16_t pixel = random(PIXEL_COUNT);
     const uint8_t hue = animationPhase + spark * 37U;
@@ -542,7 +433,7 @@ void renderAudioSparkle() {
 
 void renderAudioPulse() {
   animationPhase += displayAudio.beat > 0.6f ? 13U : 2U;
-  const float intensity = clamp01(0.035f + displayAudio.overall * 0.88f +
+  const float intensity = clamp01(displayAudio.overall * 0.88f +
                                   displayAudio.beat * 0.22f);
   fillStrip(scaleColor(colorWheel(animationPhase), intensity));
 }
@@ -573,7 +464,6 @@ void renderAudioWave() {
 }
 
 void renderAudioSpectrum() {
-  static float columnHeight[MATRIX_WIDTH] = {};
   animationPhase += displayAudio.beat > 0.55f ? 6U : 1U;
 
   const float targets[MATRIX_WIDTH] = {
@@ -588,18 +478,18 @@ void renderAudioSpectrum() {
 
   strip.clear();
   for (uint8_t x = 0; x < MATRIX_WIDTH; ++x) {
-    if (targets[x] > columnHeight[x]) {
-      columnHeight[x] += (targets[x] - columnHeight[x]) * 0.70f;
+    if (targets[x] > spectrumHeights[x]) {
+      spectrumHeights[x] += (targets[x] - spectrumHeights[x]) * 0.70f;
     } else {
-      columnHeight[x] *= 0.82f;
+      spectrumHeights[x] *= 0.82f;
     }
 
     const uint8_t height = static_cast<uint8_t>(
-        constrain(static_cast<int>(columnHeight[x] * 9.0f), 0,
+        constrain(static_cast<int>(spectrumHeights[x] * 9.0f), 0,
                   static_cast<int>(MATRIX_HEIGHT)));
     for (uint8_t y = 0; y < height; ++y) {
       uint32_t color = colorWheel(animationPhase + x * 12U + y * 18U);
-      float intensity = 0.38f + columnHeight[x] * 0.62f;
+      float intensity = 0.38f + spectrumHeights[x] * 0.62f;
       if (displayAudio.beat > 0.72f && y == height - 1U) {
         color = strip.Color(255, 255, 255);
         intensity = 1.0f;
@@ -611,7 +501,7 @@ void renderAudioSpectrum() {
 }
 
 void updateLights() {
-  if (lightsOff || currentLightMode == MODE_STATIC) return;
+  if (!controls.lightsOn || currentLightMode == MODE_STATIC) return;
 
   const bool audioMode = currentLightMode >= MODE_AUDIO_SPARKLE;
   const uint32_t interval = audioMode ? 30U : 0U;
@@ -621,7 +511,11 @@ void updateLights() {
   }
   if (audioMode) {
     animationTimestamp = millis();
-    updateDisplayAudio();
+    if (!displayAudio.active) {
+      strip.clear();
+      strip.show();
+      return;
+    }
   }
 
   switch (currentLightMode) {
@@ -660,260 +554,232 @@ void updateLights() {
 
 // ----------------------------- BLE controls --------------------------------
 
-class ServerCallbacks : public BLEServerCallbacks {
-  void onConnect(BLEServer *server) override {
-    (void)server;
-    bleConnected = true;
-  }
-
-  void onDisconnect(BLEServer *server) override {
-    bleConnected = false;
-    server->startAdvertising();
-  }
-};
-
-class CommandCallbacks : public BLECharacteristicCallbacks {
-  void onWrite(BLECharacteristic *characteristic) override {
-    // `auto` works with std::string in ESP32 core 2.x and Arduino String in
-    // core 3.x, whose BLE APIs changed return type.
-    const auto value = characteristic->getValue();
-    if (value.length() > 0U) pendingBleCommand = value[0];
-  }
-};
-
-void setupBLE() {
-  BLEDevice::init(BLUETOOTH_NAME);
-  bleServer = BLEDevice::createServer();
-  bleServer->setCallbacks(new ServerCallbacks());
-
-  BLEService *service = bleServer->createService(SERVICE_UUID);
-  bleTxCharacteristic = service->createCharacteristic(
-      TX_UUID, BLECharacteristic::PROPERTY_NOTIFY);
-  bleTxCharacteristic->addDescriptor(new BLE2902());
-
-  BLECharacteristic *rxCharacteristic = service->createCharacteristic(
-      RX_UUID, BLECharacteristic::PROPERTY_WRITE);
-  rxCharacteristic->setCallbacks(new CommandCallbacks());
-
-  service->start();
-  bleServer->getAdvertising()->addServiceUUID(SERVICE_UUID);
-  bleServer->startAdvertising();
+void updateStatusSnapshot() {
+  DeviceStatus status;
+  status.controls = controls;
+  status.bluetoothConnected = bluetoothConnected.load();
+  status.bluetoothPlaying = bluetoothPlaying.load();
+  status.playbackAvailable = bluetoothConnected.load() &&
+      bluetoothTransportAvailable.load() && transportTaskReady;
+  status.speakerReady = speakerReady;
+  status.bluetoothPcmActive = displayAudio.active;
+  status.level = displayAudio.overall;
+  status.bass = displayAudio.bass;
+  status.mid = displayAudio.mid;
+  status.treble = displayAudio.treble;
+  status.uptime = millis();
+  status.freeHeap = ESP.getFreeHeap();
+  status.revision = controlRevision;
+  publishDeviceStatus(status);
 }
 
-void processBleCommand(char command) {
-  switch (command) {
-    case 'N':
-      setLightsPower(true);
-      break;
-    case 'F':
-      setLightsPower(false);
-      break;
-    case 'U':
-      setBrightnessValue(brightness + 20);
-      break;
-    case 'D':
-      setBrightnessValue(brightness - 20);
-      break;
-    case 'W':
-      setStaticColor(strip.Color(255, 255, 255));
-      break;
-    case 'R':
-      setStaticColor(strip.Color(255, 0, 0));
-      break;
-    case 'G':
-      setStaticColor(strip.Color(0, 255, 0));
-      break;
-    case 'B':
-      setStaticColor(strip.Color(0, 0, 255));
-      break;
-    case 'C':
-      currentLightMode = MODE_RAINBOW;
-      break;
-    case 'J':
-      currentLightMode = MODE_BLINK;
-      break;
-    case 'K':
-      currentLightMode = MODE_COLOR_BLEND;
-      break;
-    case 'A':
-      currentLightMode = MODE_FADE_7;
-      break;
-    case '1':
-      currentLightMode = MODE_AUDIO_SPARKLE;
-      break;
-    case '2':
-      currentLightMode = MODE_AUDIO_PULSE;
-      break;
-    case '3':
-      currentLightMode = MODE_AUDIO_WAVE;
-      break;
-    case 'S':
-      currentLightMode = MODE_AUDIO_SPECTRUM;
-      break;
-    default:
-      break;
+void transportTask(void *) {
+  TransportAction action;
+  for (;;) {
+    if (xQueueReceive(transportQueue, &action, portMAX_DELAY) == pdTRUE) {
+      if (!bluetoothConnected.load() || !bluetoothTransportAvailable.load()) continue;
+      switch (action) {
+        case TransportAction::Play: a2dpSink.play(); break;
+        case TransportAction::Pause: a2dpSink.pause(); break;
+        case TransportAction::Stop: a2dpSink.stop(); break;
+        case TransportAction::Next: a2dpSink.next(); break;
+        case TransportAction::Previous: a2dpSink.previous(); break;
+      }
+    }
   }
+}
+
+ControlResult executeControl(const ControlCommand &command, bool remoteVolume = false) {
+  const bool playbackAvailable = bluetoothConnected.load() &&
+      bluetoothTransportAvailable.load() && transportTaskReady;
+  ControlResult result = applyControlCommand(controls, command, playbackAvailable);
+  if (!result.ok) return result;
+  if (remoteVolume) controls.muted = false;
+  if (result.actions & ACTION_LIGHTS) applyLightState();
+  if ((result.actions & ACTION_VOLUME) && !remoteVolume)
+    a2dpSink.set_volume(controls.muted ? 0 : controls.volume);
+  if (result.actions & ACTION_DOWNMIX) a2dpSink.set_mono_downmix(controls.mono);
+  if (result.actions & ACTION_CALIBRATE) {
+    audioMeterInitialized = false;
+    lastAudioSequence = 0;
+    audioFastEnvelope = audioSlowEnvelope = 0;
+    displayAudio = {};
+    memset(spectrumHeights, 0, sizeof(spectrumHeights));
+  }
+  if ((result.actions & ACTION_WIFI_RECONNECT) && !requestWifiReconnect()) {
+    result.ok = false;
+    result.message = "Wi-Fi service is unavailable; check private configuration and Serial Monitor";
+  }
+  if (result.actions & ACTION_TRANSPORT) {
+    TransportAction action = static_cast<TransportAction>(command.value);
+    if (!transportQueue || xQueueSend(transportQueue, &action, 0) != pdTRUE) {
+      result.ok = false;
+      result.message = "playback queue is full; retry";
+    }
+  }
+  if (result.ok && !isReadOnlyCommand(command.kind)) ++controlRevision;
+  updateStatusSnapshot();
+  return result;
+}
+
+void sendBleText(const char *format, ...) {
+  CommandReply reply = {};
+  va_list args;
+  va_start(args, format);
+  vsnprintf(reply.message, sizeof(reply.message), format, args);
+  va_end(args);
+  if (bleReplyQueue && xQueueSend(bleReplyQueue, &reply, 0) != pdTRUE)
+    Serial.println(F("BLE replies busy: wait for the current reply before sending commands"));
+}
+
+void sendBleWifiStatus() {
+  const WifiStatus wifi = readWifiStatus();
+  sendBleText("wifi %s; ssid %s; ip %s; signal %d dBm; setup %s; "
+      "setup-ip 192.168.4.1; hostname pc-tuner.local\n",
+      !wifi.serviceReady ? "unavailable" : wifi.connected ? "connected" : "disconnected",
+      *wifi.ssid ? wifi.ssid : "not-configured", *wifi.ip ? wifi.ip : "none",
+      wifi.rssi, wifi.setupAp ? "on" : "off");
+}
+
+void sendBleError(const char *message) {
+  sendBleText("error %s\n", message);
+}
+
+void processControlQueue() {
+  // The source can update volume from a Bluetooth task. Keep the latest value
+  // even if the control queue is busy, and mutate shared state only here.
+  const int remoteVolume = pendingRemoteVolume.exchange(-1);
+  if (remoteVolume >= 0) {
+    ControlCommand volume;
+    volume.kind = CommandKind::Volume;
+    volume.value = remoteVolume;
+    executeControl(volume, true);
+  }
+  QueuedControl queued;
+  for (int count = 0; count < 8 && controlQueue &&
+       xQueueReceive(controlQueue, &queued, 0) == pdTRUE; ++count) {
+    const ControlResult result = executeControl(
+        queued.command, queued.origin == CommandOrigin::RemoteVolume);
+    CommandReply reply = {};
+    reply.id = queued.id;
+    reply.ok = result.ok;
+    reply.kind = queued.command.kind;
+    if (queued.origin == CommandOrigin::Web) {
+      strlcpy(reply.message, result.message, sizeof(reply.message));
+      xQueueSend(webReplyQueue, &reply, 0);
+    } else if (queued.origin == CommandOrigin::Bluetooth) {
+      if (queued.command.kind == CommandKind::Status) {
+        sendBleText("lights %s; brightness %u; effect %s; color #%06lX; "
+          "sensitivity %.2f; source %s\n",
+          controls.lightsOn ? "on" : "off", controls.brightness, effectName(controls.mode),
+          static_cast<unsigned long>(controls.color), controls.sensitivity,
+          sourceName(controls.source));
+        sendBleText("volume %u; mute %s; downmix %s; bluetooth %s; playback %s; "
+          "transport %s; PCM %s; speaker %s; revision %lu\n",
+          controls.volume, controls.muted ? "on" : "off",
+          controls.mono ? "mono" : "stereo",
+          bluetoothConnected.load() ? "connected" : "disconnected",
+          bluetoothPlaying.load() ? "playing" : "paused",
+          bluetoothTransportAvailable.load() ? "ready" : "unavailable",
+          displayAudio.active ? "active" : "idle",
+          speakerReady ? "ready" : "unavailable",
+          static_cast<unsigned long>(controlRevision));
+        sendBleWifiStatus();
+      } else if (queued.command.kind == CommandKind::WifiStatus) {
+        sendBleWifiStatus();
+      } else if (queued.command.kind == CommandKind::Help) {
+        bleHelpLine = 0;
+      } else {
+        sendBleText("%s %s: %s\n",
+          result.ok ? "ok" : "error", commandName(queued.command.kind), result.message);
+      }
+    }
+  }
+}
+
+void receiveBleCommand(const char *line) {
+  if (!line) {
+    sendBleError("command too long or contains NUL; send a new complete line");
+    return;
+  }
+  uint32_t id;
+  const char *error;
+  if (!enqueueControl(line, CommandOrigin::Bluetooth, id, error)) sendBleError(error);
+}
+
+void setupBLE() {
+  if (!setupBleUart(BLE_CONTROL_NAME, receiveBleCommand))
+    Serial.println(F("[bluetooth] BLE UART could not initialize; check resource logs"));
 }
 
 void checkBleInput() {
-  const char command = pendingBleCommand;
-  if (command == '\0') return;
-  pendingBleCommand = '\0';
-  processBleCommand(command);
+  serviceBleUart();
+  static CommandReply active = {};
+  static size_t offset = 0;
+  static uint32_t lastSend = 0;
+  if (!bleUartConnected()) {
+    active.message[0] = '\0'; offset = 0;
+    bleHelpLine = CONTROL_HELP_COUNT;
+    CommandReply discarded;
+    while (bleReplyQueue && xQueueReceive(bleReplyQueue, &discarded, 0) == pdTRUE) {}
+    return;
+  }
+  if (!bleUartSubscribed()) return;
+  if (static_cast<uint32_t>(millis() - lastSend) < 25) return;
+  if (!active.message[0]) {
+    if (!bleReplyQueue) return;
+    if (xQueueReceive(bleReplyQueue, &active, 0) != pdTRUE) {
+      if (bleHelpLine >= CONTROL_HELP_COUNT) return;
+      strlcpy(active.message, CONTROL_HELP_LINES[bleHelpLine++], sizeof(active.message));
+    }
+    offset = 0;
+  }
+  const size_t remaining = strlen(active.message) - offset;
+  const size_t count = remaining < 20 ? remaining : 20; // Default MTU payload.
+  if (!sendBleUart(reinterpret_cast<const uint8_t *>(active.message + offset), count)) return;
+  offset += count;
+  lastSend = millis();
+  if (offset >= strlen(active.message)) active.message[0] = '\0';
 }
 
 // ------------------------------ IR controls --------------------------------
 
-void selectMode(uint8_t mode) {
-  if (lightsOff) return;
-  currentLightMode = mode;
-  animationTimestamp = 0;
-}
-
 void processIrCommand(uint16_t command, bool isRepeat) {
-  if (isRepeat && command != BTN_V_UP && command != BTN_V_DOWN) return;
-
-  switch (command) {
-    case BTN_ON:
-      setLightsPower(true);
-      break;
-    case BTN_OFF:
-      setLightsPower(false);
-      break;
-    case BTN_V_UP:
-      setBrightnessValue(brightness + 10);
-      break;
-    case BTN_V_DOWN:
-      setBrightnessValue(brightness - 10);
-      break;
-    case BTN_W:
-      setStaticColor(strip.Color(255, 255, 255));
-      break;
-    case BTN_B:
-      setStaticColor(strip.Color(0, 80, 255));
-      break;
-    case BTN_G:
-      setStaticColor(strip.Color(0, 255, 80));
-      break;
-    case BTN_R:
-      setStaticColor(strip.Color(255, 0, 40));
-      break;
-    case BTN_PINK_1:
-      setStaticColor(strip.Color(255, 105, 180));
-      break;
-    case BTN_PINK_2:
-      setStaticColor(strip.Color(255, 20, 147));
-      break;
-    case BTN_CYAN_1:
-      setStaticColor(strip.Color(0, 255, 255));
-      break;
-    case BTN_CYAN_2:
-      setStaticColor(strip.Color(64, 224, 208));
-      break;
-    case BTN_BLUE_2:
-      setStaticColor(strip.Color(75, 0, 255));
-      break;
-    case BTN_PURPLE_1:
-      setStaticColor(strip.Color(128, 0, 255));
-      break;
-    case BTN_PURPLE_2:
-      setStaticColor(strip.Color(186, 85, 211));
-      break;
-    case BTN_PURPLE_3:
-      setStaticColor(strip.Color(255, 0, 255));
-      break;
-    case BTN_ORANGE_1:
-      setStaticColor(strip.Color(255, 80, 0));
-      break;
-    case BTN_ORANGE_2:
-      setStaticColor(strip.Color(255, 140, 0));
-      break;
-    case BTN_ORANGE_3:
-      setStaticColor(strip.Color(255, 200, 0));
-      break;
-    case BTN_YELLOW:
-      setStaticColor(strip.Color(255, 255, 40));
-      break;
-    case BTN_LT_GREEN_1:
-      setStaticColor(strip.Color(120, 255, 0));
-      break;
-    case BTN_LT_BLUE_1:
-      setStaticColor(strip.Color(0, 180, 255));
-      break;
-    case BTN_LT_BLUE_2:
-      setStaticColor(strip.Color(0, 128, 180));
-      break;
-    case BTN_GREEN_BLUE:
-      setStaticColor(strip.Color(0, 255, 140));
-      break;
-    case BTN_S1:
-      selectMode(MODE_AUDIO_SPECTRUM);
-      break;
-    case BTN_S2:
-      selectMode(MODE_AUDIO_SPARKLE);
-      break;
-    case BTN_S3:
-      selectMode(MODE_AUDIO_PULSE);
-      break;
-    case BTN_S4:
-      selectMode(MODE_AUDIO_WAVE);
-      break;
-    case BTN_JUMP3:
-      selectMode(MODE_BLINK);
-      break;
-    case BTN_JUMP7:
-      selectMode(MODE_COLOR_BLEND);
-      break;
-    case BTN_FLASH:
-      selectMode(MODE_FADE_3);
-      break;
-    case BTN_FADE3:
-      selectMode(MODE_RAINBOW);
-      break;
-    case BTN_FADE7:
-      selectMode(MODE_FADE_7);
-      break;
-    case BTN_DIM_1:
-      setBrightnessValue(64);
-      break;
-    case BTN_DIM_2:
-      setBrightnessValue(128);
-      break;
-    case BTN_DIM_3:
-      setBrightnessValue(192);
-      break;
-    case BTN_DIM_4:
-      setBrightnessValue(255);
-      break;
-    // The old 1H-4H fixed thresholds now select adaptive sensitivity.
-    case BTN_1H:
-      audioSensitivity = 1.60f;
-      break;
-    case BTN_2H:
-      audioSensitivity = 1.20f;
-      break;
-    case BTN_3H:
-      audioSensitivity = 0.90f;
-      break;
-    case BTN_4H:
-      audioSensitivity = 0.65f;
-      break;
-    default:
-      break;
-  }
+  ControlCommand parsed;
+  if (parseIrControl(command, isRepeat, parsed)) executeControl(parsed);
 }
 
 void checkIrInput() {
   if (!IrReceiver.decode()) return;
 
+  const bool known = IrReceiver.decodedIRData.protocol != UNKNOWN;
   const bool isRepeat =
       (IrReceiver.decodedIRData.flags & IRDATA_FLAGS_IS_REPEAT) != 0U;
   const uint16_t command = IrReceiver.decodedIRData.command;
   IrReceiver.resume();
-  processIrCommand(command, isRepeat);
+  if (known) processIrCommand(command, isRepeat);
 }
 
 // ------------------------------- Audio setup -------------------------------
+
+void onAudioConnection(esp_a2d_connection_state_t state, void *) {
+  bluetoothConnected = state == ESP_A2D_CONNECTION_STATE_CONNECTED;
+  if (!bluetoothConnected.load()) {
+    bluetoothPlaying = false;
+    bluetoothTransportAvailable = false;
+  }
+  ets_printf("[bluetooth] A2DP state=%u\n", static_cast<unsigned>(state));
+}
+void onTransportConnection(bool connected) {
+  bluetoothTransportAvailable = connected;
+  ets_printf("[bluetooth] AVRCP %s\n", connected ? "connected" : "disconnected");
+}
+void onPlaybackState(esp_a2d_audio_state_t state, void *) {
+  bluetoothPlaying = state == ESP_A2D_AUDIO_STATE_STARTED;
+}
+void onRemoteVolume(int volume) {
+  if (volume >= 0 && volume <= 127) pendingRemoteVolume = volume;
+}
 
 void setupAudio() {
   AudioToolsLogger.begin(Serial, AudioToolsLogLevel::Warning);
@@ -930,42 +796,29 @@ void setupAudio() {
   speakerConfig.buffer_count = 8;
   speakerConfig.buffer_size = 128;
 
-  if (!speakerOutput.begin(speakerConfig)) {
+  speakerReady = speakerOutput.begin(speakerConfig);
+  if (!speakerReady) {
     Serial.println(F("ERROR: could not start MAX98357A I2S output"));
   }
 
-  auto microphoneConfig = microphoneInput.defaultConfig(RX_MODE);
-  microphoneConfig.sample_rate = MIC_SAMPLE_RATE;
-  microphoneConfig.channels = 1;
-  microphoneConfig.bits_per_sample = 32;
-  microphoneConfig.port_no = MIC_I2S_PORT;
-  microphoneConfig.pin_bck = MIC_BCLK_PIN;
-  microphoneConfig.pin_ws = MIC_WS_PIN;
-  microphoneConfig.pin_data = MIC_DATA_PIN;
-  microphoneConfig.i2s_format = I2S_STD_FORMAT;
-  microphoneConfig.buffer_count = 4;
-  microphoneConfig.buffer_size = 256;
-
-#if ESP_IDF_VERSION_MAJOR >= 5
-  microphoneConfig.channel_format = I2SChannelSelect::Left;
-#else
-  microphoneConfig.channel_format = I2S_CHANNEL_FMT_ONLY_LEFT;
-#endif
-
-  microphoneReady = microphoneInput.begin(microphoneConfig);
-  if (microphoneReady) {
-    // Never let microphone capture stall animation or Bluetooth processing.
-    microphoneInput.driver()->setWaitTimeReadMs(0);
-  } else {
-    Serial.println(F("ERROR: could not start I2S microphone input"));
+  logRuntimeMemory("after speaker I2S driver");
+  if (!startTunerBluetoothController()) {
+    Serial.println(F("ERROR: Bluetooth controller could not start; audio/BLE not advertised"));
+    return;
   }
-
+  logRuntimeMemory("after Bluetooth controller");
   a2dpSink.set_default_bt_mode(ESP_BT_MODE_BTDM);
   // One MAX98357A drives one speaker, so mix both A2DP channels to mono.
   a2dpSink.set_mono_downmix(true);
   a2dpSink.set_stream_reader(onBluetoothAudio, true);
+  a2dpSink.set_on_connection_state_changed(onAudioConnection);
+  a2dpSink.set_on_audio_state_changed_post(onPlaybackState);
+  a2dpSink.set_avrc_connection_state_callback(onTransportConnection);
+  a2dpSink.set_avrc_rn_volumechange(onRemoteVolume);
+  a2dpSink.set_volume(controls.volume);
   a2dpSink.set_auto_reconnect(true);
   a2dpSink.start(BLUETOOTH_NAME);
+  logRuntimeMemory("after A2DP stack");
 }
 
 // -------------------------------- Arduino ----------------------------------
@@ -973,6 +826,18 @@ void setupAudio() {
 void setup() {
   Serial.begin(115200);
   delay(100);
+  installRuntimeDiagnostics();
+  Serial.println(F("OTL PC Tuner startup: testing-bluetooth-only-1"));
+  logRuntimeMemory("boot");
+  controlQueue = xQueueCreate(runtime_resources::CONTROL_QUEUE_DEPTH, sizeof(QueuedControl));
+  webReplyQueue = xQueueCreate(runtime_resources::WEB_REPLY_DEPTH, sizeof(CommandReply));
+  bleReplyQueue = xQueueCreate(runtime_resources::BLE_REPLY_DEPTH, sizeof(CommandReply));
+  transportQueue = xQueueCreate(4, sizeof(TransportAction));
+  if (!controlQueue || !webReplyQueue || !bleReplyQueue || !transportQueue) {
+    Serial.println(F("ERROR: not enough memory for control queues"));
+    return;
+  }
+  logRuntimeMemory("after control queues");
 
   strip.begin();
   strip.setBrightness(brightness);
@@ -983,20 +848,39 @@ void setup() {
 
   // Start A2DP in dual-mode Bluetooth before adding the BLE control service.
   setupAudio();
-  setupBLE();
+  if (esp_bt_controller_get_status() == ESP_BT_CONTROLLER_STATUS_ENABLED &&
+      esp_bluedroid_get_status() == ESP_BLUEDROID_STATUS_ENABLED) setupBLE();
+  transportTaskReady = xTaskCreatePinnedToCore(
+      transportTask, "pc-playback", runtime_resources::PLAYBACK_STACK_BYTES,
+      nullptr, 1, nullptr, 1) == pdPASS;
+  if (!transportTaskReady) Serial.println(F("ERROR: Bluetooth playback task could not start"));
+  updateStatusSnapshot();
+  setupWebControl();
 
   randomSeed(static_cast<uint32_t>(micros()));
-  Serial.println(F("OTL PC Tuner ready: A2DP + BLE + mic + MAX98357A"));
+  firmwareReady = true;
+  Serial.println(F("Core controls initialized; network task will report HTTP/AP readiness separately."));
 }
 
 void loop() {
+  if (!firmwareReady) { delay(250); return; }
   checkIrInput();
+  processControlQueue();
   checkBleInput();
 
-  // Drain I2S1 continuously even while a non-audio light effect is selected.
-  // This keeps the microphone live alongside I2S0 speaker playback.
-  readMicrophone();
+  static uint32_t lastMeter = 0;
+  if (static_cast<uint32_t>(millis() - lastMeter) >= 30) {
+    lastMeter = millis();
+    updateDisplayAudio();
+    updateStatusSnapshot();
+  }
   updateLights();
+  static uint32_t lastMemoryLog = 0;
+  if (static_cast<uint32_t>(millis() - lastMemoryLog) >=
+      runtime_resources::MEMORY_LOG_INTERVAL_MS) {
+    lastMemoryLog = millis();
+    logRuntimeMemory("running");
+  }
 
   delay(1);
 }

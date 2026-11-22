@@ -1,24 +1,45 @@
 # ESP32 PC Tuner
 
-An ESP32-based Bluetooth speaker and sound-reactive 8×8 RGB matrix controller. The firmware receives music over Bluetooth A2DP, plays it through a MAX98357A amplifier, keeps an I2S microphone active at the same time, and drives responsive lighting from the audio actually sent to the speaker.
+An ESP32-based Bluetooth speaker and sound-reactive 8×8 RGB matrix controller. The firmware receives music over Bluetooth A2DP, plays it through a MAX98357A amplifier, and drives lighting exclusively from that decoded Bluetooth PCM. Microphone capture and fallback have been removed.
 
-> **Current status:** firmware builds successfully and is ready for hardware testing. PC power switching is intentionally disabled until the planned Wi-Fi/ESP-NOW companion node is implemented.
+> **Testing branch: `testing/bluetooth-only-lights`.** Bluetooth-only lighting is not yet approved for `main`. The plain page has **no login**, the setup hotspot is **open**, and it closes once the router assigns an IP. See [docs/TESTING.md](docs/TESTING.md) for acceptance checks and the explicit-confirmation release gate. PC power switching remains disabled.
+
+## Start here
+
+- **Sketch:** `sketch_may4a/sketch_may4a.ino` — keep all accompanying `.h`/`.cpp` files. The local working copy is `E:\PC Tuner`.
+- **Wi-Fi + Internet tutorial:** [docs/WEB_AND_INTERNET.md](docs/WEB_AND_INTERNET.md).
+- **Complete Bluetooth commands:** [docs/BLUETOOTH_COMMANDS.md](docs/BLUETOOTH_COMMANDS.md).
+- **Current LAN page:** `http://192.168.100.33/` or `http://pc-tuner.local/`.
+- **Provisioning:** `PC-Tuner-Setup-3B89`, no password, `http://192.168.4.1/`.
+
+This PC was found on Ethernet, not Wi-Fi. Use the ESP32's open setup page
+to enter the **same home router's 2.4 GHz Wi-Fi** details. The Ethernet PC can
+reach the ESP32 on that LAN. For another network, use the documented outbound
+HTTPS tunnel through an always-on home host; no router port forwarding is needed.
+Because device login was removed, require an external email/Access/VPN gate
+before exposing controls over the Internet. Legacy device/hotspot passwords
+in `private/access.txt` are unused.
 
 ## Features
 
 - Bluetooth Classic **A2DP sink** for phone/PC music playback.
 - Simultaneous Bluetooth Classic and **BLE controls** using ESP32 BTDM mode.
-- Simultaneous audio input and output using both ESP32 I2S controllers:
-  - I2S0 TX for the MAX98357A speaker amplifier.
-  - I2S1 RX for the digital microphone.
+- I2S0 TX for the MAX98357A speaker amplifier; no I2S1 RX driver, DMA buffers, or microphone sampling.
 - Mono downmix so both stereo channels are heard through one speaker.
 - Audio-responsive lighting based on the decoded PCM sent to the amplifier.
-- Automatic microphone fallback when Bluetooth playback has been inactive for 300 ms.
-- Adaptive gain, microphone noise-floor tracking, beat detection, and efficient bass/mid/treble estimation.
+- Music effects go dark after 300 ms without fresh Bluetooth PCM; there is no ambient-audio fallback.
+- Adaptive Bluetooth PCM gain, beat detection, and efficient bass/mid/treble estimation.
 - Four music modes: spectrum, wave, pulse, and sparkle.
 - Rainbow, blink, color-blend, fade, static-color, and brightness modes.
 - 8×8 WS2812/NeoPixel matrix mapping with configurable serpentine wiring.
 - IR remote control and Nordic UART Service BLE control.
+- Plain, no-login web page with buttons for every existing lighting/audio function; 5.6 KB HTML, 1.9 KB gzip.
+- All 23 color presets (including original IR tints) and all 10 effects available over web and BLE.
+- Readable commands such as `lights on`, `color deep-pink`, `effect spectrum`, and `audio pause`.
+- Speaker volume, mute, playback, Bluetooth-meter calibration, complete help, and network status.
+- Open, device-specific setup hotspot; verified-router NVS persistence, automatic retries, and mDNS.
+- No automatic web polling, dynamic JSON catalog, or login/session allocations.
+- Optional HTTPS Internet access through a home `cloudflared` connector, with email/Cloudflare Access protection.
 - Non-blocking animations and queued BLE commands to avoid audio dropouts.
 - Bluetooth auto-reconnect.
 - Compatibility layer for legacy IDF 4 I2S and newer IDF 5 I2S through Arduino Audio Tools.
@@ -30,7 +51,6 @@ An ESP32-based Bluetooth speaker and sound-reactive 8×8 RGB matrix controller. 
 |---:|---|---|---|
 | 1 | ESP32 development board | Original ESP32-WROOM/ESP32 DevKit with Bluetooth Classic | ESP32-S2, S3, C3, and C6 do not provide the Bluetooth Classic A2DP sink required by this project. |
 | 1 | Addressable RGB matrix | 8×8 WS2812B/NeoPixel, 5 V, 64 pixels | Firmware defaults to serpentine row wiring. |
-| 1 | I2S microphone | INMP441 or compatible 3.3 V, 32-bit I2S microphone | Current configuration reads the left I2S slot. |
 | 1 | I2S audio amplifier | MAX98357A mono Class-D breakout | Powered from 5 V; receives standard Philips I2S. |
 | 1 | Speaker | 4 Ω, 3 W recommended; 8 Ω, 1–3 W also works | Connect only to the amplifier's differential `SPK+`/`SPK-` terminals. |
 | 1 | IR receiver | 3.3 V-compatible demodulating receiver, such as VS1838B/TSOP-style module | Connect its digital output to GPIO 34. |
@@ -53,9 +73,7 @@ Optional but useful: a powered USB cable with data-only isolation, screw termina
 | GPIO 22 | Output | MAX98357A | DIN | I2S0 TX |
 | GPIO 25 | Output | MAX98357A | LRC / WS | I2S0 TX |
 | GPIO 26 | Output | MAX98357A | BCLK | I2S0 TX |
-| GPIO 32 | Output | I2S microphone | WS / LRCLK | I2S1 RX clock |
-| GPIO 33 | Output | I2S microphone | SCK / BCLK | I2S1 RX clock |
-| GPIO 35 | Input only | I2S microphone | SD / DOUT | I2S1 RX data |
+| GPIO 32, 33, 35 | Unused | Former microphone wiring | No signal generated/captured | Available for future use |
 | GPIO 34 | Input only | IR receiver | OUT | IR input |
 | GPIO 16 | Unused | Reserved | Former PC power pin; no current function | Future feature available |
 
@@ -66,8 +84,8 @@ GPIO 4 is an ESP32 boot-strapping pin. The WS2812 data input normally does not d
 | Rail | Connections |
 |---|---|
 | Regulated 5 V | RGB matrix 5 V, MAX98357A VIN, and ESP32 `5V/VIN` only if the specific board supports 5 V input there |
-| ESP32 3.3 V | I2S microphone VDD and a 3.3 V-compatible IR receiver |
-| Common GND | ESP32, matrix, amplifier, microphone, IR receiver, and external supply |
+| ESP32 3.3 V | A 3.3 V-compatible IR receiver |
+| Common GND | ESP32, matrix, amplifier, IR receiver, and external supply |
 | Speaker | MAX98357A `SPK+` and `SPK-` only; neither speaker lead goes to ground |
 
 ### Wiring overview
@@ -77,12 +95,6 @@ GPIO 4 is an ESP32 boot-strapping pin. The WS2812 data input normally does not d
 ESP32 GPIO26 --------------> BCLK                                  SPK+ / SPK-
 ESP32 GPIO25 --------------> LRC/WS
 ESP32 GPIO22 --------------> DIN
-
-                            +---------------- I2S microphone
-ESP32 GPIO33 --------------> SCK/BCLK
-ESP32 GPIO32 --------------> WS/LRCLK
-ESP32 GPIO35 <-------------- SD/DOUT
-Mic L/R -------------------> GND (left slot)
 
 ESP32 GPIO4 --> 74AHCT125 --> 330–470 Ω --> 8×8 matrix DIN
 ESP32 GPIO34 <-------------------------------- IR receiver OUT
@@ -103,7 +115,7 @@ These are engineering estimates, not measurements. Actual WS2812 revisions, brig
 | ESP32 with A2DP + BLE | 0.10–0.25 A | 0.50 A transient budget | Up to 2.5 W |
 | 64-pixel WS2812 matrix | 0.3–1.8 A for normal animated patterns | 3.84 A at 64 × 60 mA full white | Up to 19.2 W |
 | MAX98357A + 4 Ω speaker | 0.10–0.45 A for normal music | Approximately 0.75 A near maximum output | Up to 3.75 W input |
-| I2S microphone + IR receiver | Below 0.01 A | 0.02 A budget | Below 0.1 W |
+| IR receiver | Below 0.01 A | 0.02 A conservative budget | Below 0.1 W |
 | **Estimated system total** | **Approximately 0.5–2.5 A** | **Approximately 5.1 A** | **Approximately 2.5–25.5 W** |
 
 The firmware starts at brightness `192/255` (about 75%). A theoretical all-white matrix at that limit can still approach 2.9 A, and the controls allow brightness to reach 255. Design the wiring for the 5.1 A worst-case estimate rather than the average animation load.
@@ -113,7 +125,7 @@ The firmware starts at brightness `192/255` (about 75%). A theoretical all-white
 - Use a regulated **5 V, 6 A (30 W)** supply for comfortable margin.
 - Feed the matrix and amplifier directly from the supply, not through the ESP32 board.
 - Use adequately sized power and ground wire; inject matrix power at more than one point if voltage drop is visible.
-- Keep audio and microphone wiring away from high-current LED leads.
+- Keep I2S audio wiring away from high-current LED leads.
 - Place the bulk capacitor near the matrix and add local amplifier decoupling according to the MAX98357A breakout documentation.
 - Start testing with low LED brightness and low phone volume.
 
@@ -121,19 +133,31 @@ The firmware starts at brightness `192/255` (about 75%). A theoretical all-white
 
 Bluetooth A2DP delivers interleaved, volume-processed 16-bit PCM. A short callback calculates amplitude and approximate bass/mid/treble energy without drawing pixels or delaying I2S writes. The Arduino loop reads those shared levels and renders LEDs at a controlled frame rate.
 
-The microphone remains live on I2S1 while the speaker runs on I2S0. Using different controllers avoids the original problem where installing one I2S driver replaced or disabled the other. If A2DP packets stop for 300 ms, sound-reactive modes automatically switch to microphone levels.
+Only the speaker's I2S0 TX driver is initialized. Bluetooth PCM arrives through
+the A2DP callback; the loop never reads an external audio input. At 300 ms
+without fresh PCM, levels and spectrum history reset and music effects go
+dark. Non-music/static effects keep their normal behavior.
 
 ## Bluetooth controls
 
-Both Bluetooth interfaces advertise as **`OTL PC Tuner`**. Pair the media device with the Classic Bluetooth audio endpoint. BLE controls use the Nordic UART Service UUIDs.
+Classic audio advertises **`OTL PC Tuner`**; BLE UART advertises **`OTL PC Tuner BLE`**. Use Nordic UART in a BLE app, not Classic serial/SPP. Only one BLE controller connects at a time.
 
 | BLE command | Action |
 |---|---|
-| `N` / `F` | Lights on / off; these commands no longer switch the PC |
-| `U` / `D` | Brightness up / down |
-| `W`, `R`, `G`, `B` | White, red, green, or blue static color |
-| `C`, `J`, `K`, `A` | Rainbow, blink, color blend, or seven-color fade |
-| `1`, `2`, `3`, `S` | Audio sparkle, pulse, wave, or spectrum |
+| `lights on` / `lights off` / `lights toggle` | LED power, independent of the speaker |
+| `brightness up` / `brightness down` / `brightness high` | Brightness adjustment or named preset; numbers 0–255 also work |
+| `color white` / `color rose-red` / `color #00AACC` | All named colors or custom RGB |
+| `effect rainbow` / `effect fade-seven` / `effect spectrum` | All static, animated, and music modes |
+| `sensitivity balanced` / `source bluetooth` / `calibrate audio` | Bluetooth lighting sensitivity and adaptive meters |
+| `volume normal` / `mute on` / `downmix mono` | Speaker controls, independent of LED brightness |
+| `audio play` / `audio pause` / `audio stop` / `audio next` / `audio previous` | AVRCP control of the paired music source |
+| `wifi reconnect` / `wifi status` | Network connection/status; no password echo |
+| `settings reset` / `status` / `help` | Defaults, live state, complete command help |
+
+Append a real **LF, CRLF, or CR** to each BLE command and subscribe to NUS TX
+notifications for replies. The old single-character commands are replaced.
+See [docs/BLUETOOTH_COMMANDS.md](docs/BLUETOOTH_COMMANDS.md) for every parameter,
+UUID, preset, and BLE fragmentation example.
 
 The existing IR remote color, effect, brightness, and sensitivity buttons remain supported. The former 1H–4H threshold buttons now select adaptive audio sensitivity.
 
@@ -150,12 +174,16 @@ The following versions were detected and used for the verified build:
 | ESP32-A2DP | 1.8.10 |
 | Arduino Audio Tools | 1.2.2 |
 
-`AudioTools.h` must be included before `BluetoothA2DPSink.h`, as done in the sketch. The firmware also contains the IDF 5 channel-selection path for a correctly installed newer ESP32 core.
+ArduinoJson is no longer needed. HTTP, Wi-Fi, BLE, and mDNS use the bundled
+ESP32 SDK, with bounded memory profiles.
+
+`AudioTools.h` must be included before `BluetoothA2DPSink.h`, as done in the
+sketch. The tested board core is 2.0.10; do not infer validation of newer cores.
 
 ## Build and upload
 
-1. Clone the repository.
-2. Open `sketch_may4a/sketch_may4a.ino` in Arduino IDE.
+1. Use the local project or check out `testing/bluetooth-only-lights`. Do not use this testing change as an approved `main` release.
+2. Run `python tools/configure_local.py` from that folder. It preserves existing private configuration. Then open `sketch_may4a/sketch_may4a.ino` in Arduino IDE.
 3. Install the libraries listed above through Library Manager or from their official repositories.
 4. Select these board options:
 
@@ -168,14 +196,26 @@ The following versions were detected and used for the verified build:
    | PSRAM | Disabled, unless the actual module includes it |
 
 5. Compile, upload, and open Serial Monitor at 115200 baud.
-6. Pair `OTL PC Tuner` as a Bluetooth audio device and select one of the audio lighting modes.
+6. Join the open, MAC-suffixed `PC-Tuner-Setup-3B89` hotspot. Forget the previously saved WPA2 entry if needed. Open `http://192.168.4.1` without signing in and enter the router's 2.4 GHz credentials. The hotspot closes at successful router connection; use the station IP or `http://pc-tuner.local` afterward.
+7. Pair `OTL PC Tuner` as a Bluetooth audio device and select one of the audio lighting modes. BLE controls and web controls remain available.
 
-Verified build usage with warnings enabled:
+Repeat the local build and tests without uploading:
 
-- Flash: **1,380,097 / 3,145,728 bytes (43%)**
-- Static RAM: **51,300 / 327,680 bytes (15%)**
+```powershell
+python tools/compile_firmware.py
+python tools/run_local_tests.py
+python tools/local_server.py
+```
 
-Hardware behavior still needs to be validated on the final assembled circuit before enclosure installation or unattended use.
+The loopback simulator opens at `http://localhost:8765` and visibly identifies
+itself as **LOCAL SIMULATION**. It does not operate an ESP32 and must never be
+tunneled. See [docs/LOCAL_TEST_RESULTS.md](docs/LOCAL_TEST_RESULTS.md) for exact
+build usage, test scope, and limitations.
+
+Basic web/router/BLE behavior of the earlier lightweight build was checked
+on the device. The Bluetooth-only testing change still requires its own
+hardware acceptance checks, especially sustained audio and circuit-connected
+reset behavior. See [docs/TESTING.md](docs/TESTING.md).
 
 ## Configuration
 
@@ -183,10 +223,12 @@ The main hardware options are near the top of `sketch_may4a.ino`:
 
 - `MATRIX_SERPENTINE`: set to `false` for progressive rows.
 - `SPEAKER_BCLK_PIN`, `SPEAKER_WS_PIN`, `SPEAKER_DATA_PIN`: MAX98357A wiring.
-- `MIC_BCLK_PIN`, `MIC_WS_PIN`, `MIC_DATA_PIN`: microphone wiring.
-- `MIC_SAMPLE_RATE`: microphone capture rate; currently 32 kHz.
+- Optional bootstrap router credentials live in ignored `sketch_may4a/LocalConfig.h`; no device/hotspot password is used.
+- Router Wi-Fi is entered in the plain setup page and saved after successful connection. Responses and BLE never return router passwords.
+- Edit `web/index.html`, then run `python tools/build_web.py` to synchronize the embedded `WebPage.h`.
 
-The microphone is configured for the left I2S slot. For a microphone whose L/R pin is tied high, change the modern configuration to `I2SChannelSelect::Right` and the legacy configuration to `I2S_CHANNEL_FMT_ONLY_RIGHT`.
+The former microphone can be disconnected with power off. GPIO32/33/35 are
+unused in this firmware, and the microphone is no longer required hardware.
 
 ## Upcoming updates
 
@@ -203,23 +245,25 @@ The following items are planned; they are **not implemented in the current firmw
 ### 2. Configuration and maintenance
 
 - NVS persistence for brightness, last mode, sensitivity, and matrix orientation.
-- Wi-Fi provisioning without hard-coded credentials.
 - OTA firmware updates and a recovery path.
-- Optional local web interface for setup and diagnostics.
+
+Wi-Fi provisioning, web setup, and network credential persistence are already
+implemented in this local update. Lighting settings are not yet persisted.
 
 ### 3. Audio and lighting improvements
 
 - True FFT-based eight-band spectrum mode.
-- Guided microphone noise-floor and gain calibration.
+- Further Bluetooth PCM gain/beat calibration.
 - Configurable matrix rotation, origin, and color correction.
 - Current-aware LED brightness limiting based on the configured supply capacity.
 
 ### 4. Controls and status
 
-- BLE command acknowledgements and live connection/audio-source status.
-- Play/pause, previous/next, and volume commands over BLE and IR.
+- Optional encrypted/bonded BLE control and a dedicated IR playback layout.
 - Bluetooth metadata display support for a future OLED or companion application.
-- Optional mobile control interface.
+
+BLE acknowledgements, live status, playback/volume over BLE and web, and the
+responsive web control interface are already implemented locally.
 
 ## Safety notes
 

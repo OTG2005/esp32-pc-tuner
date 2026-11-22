@@ -1,0 +1,42 @@
+<!doctype html><html lang="en"><meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>PC Tuner</title>
+<style>body{font:16px sans-serif;max-width:850px;margin:16px}button,input{font:inherit;margin:3px;padding:6px}h2{font-size:18px;margin:18px 0 5px}pre{white-space:pre-wrap;overflow-wrap:anywhere}</style>
+<h1>PC Tuner</h1>
+<p>No device login. Open setup Wi-Fi closes after the router connects.</p>
+<h2>Wi-Fi setup</h2>
+<form action="/api/wifi" method="post">
+<input name="ssid" aria-label="Router SSID" placeholder="2.4 GHz router SSID" maxlength="32" required>
+<input name="password" aria-label="Router password" placeholder="Router password (blank if open)" type="password" maxlength="64">
+<button>Connect router</button></form>
+<h2>Lights</h2>
+<button data-c="lights on">On</button><button data-c="lights off">Off</button><button data-c="lights toggle">Toggle</button>
+<button data-c="brightness down">Dimmer</button><button data-c="brightness up">Brighter</button>
+<input id="brightness" aria-label="Brightness" type="number" min="0" max="255" value="128"><button onclick="level('brightness')">Set brightness</button>
+<button data-c="brightness low">Low</button><button data-c="brightness normal">Normal</button><button data-c="brightness high">High</button><button data-c="brightness maximum">Maximum</button>
+<h2>Colors</h2><div id="colors">
+<button data-c="color white">White</button><button data-c="color red">Red</button><button data-c="color green">Green</button><button data-c="color blue">Blue</button><button data-c="color pink">Pink</button><button data-c="color deep-pink">Deep pink</button><button data-c="color cyan">Cyan</button><button data-c="color turquoise">Turquoise</button><button data-c="color indigo">Indigo</button><button data-c="color purple">Purple</button><button data-c="color orchid">Orchid</button><button data-c="color magenta">Magenta</button><button data-c="color orange">Orange</button><button data-c="color amber">Amber</button><button data-c="color gold">Gold</button><button data-c="color yellow">Yellow</button><button data-c="color lime">Lime</button><button data-c="color sky-blue">Sky blue</button><button data-c="color teal">Teal</button><button data-c="color mint">Mint</button><button data-c="color rose-red">IR red</button><button data-c="color spring-green">IR green</button><button data-c="color azure-blue">IR blue</button></div>
+<input id="color" aria-label="Custom RGB" value="#FFFFFF" maxlength="7"><button onclick="level('color')">Set RGB</button>
+<h2>Effects</h2><div id="effects">
+<button data-c="effect static">Static</button><button data-c="effect rainbow">Rainbow</button><button data-c="effect blink">Blink</button><button data-c="effect blend">Blend</button><button data-c="effect fade-three">Fade 3</button><button data-c="effect fade-seven">Fade 7</button><button data-c="effect sparkle">Sparkle</button><button data-c="effect pulse">Pulse</button><button data-c="effect wave">Wave</button><button data-c="effect spectrum">Spectrum</button></div>
+<h2>Audio lighting</h2>
+<p>Bluetooth audio only. Music effects go dark when playback stops.</p>
+<button data-c="source bluetooth">Bluetooth input</button>
+<input id="sensitivity" aria-label="Sensitivity" type="number" min=".1" max="3" step=".05" value="1"><button onclick="level('sensitivity')">Set sensitivity</button>
+<button data-c="sensitivity low">Low</button><button data-c="sensitivity balanced">Balanced</button><button data-c="sensitivity normal">Normal</button><button data-c="sensitivity high">High</button><button data-c="sensitivity maximum">Maximum</button><button data-c="calibrate audio">Calibrate</button>
+<h2>Speaker</h2>
+<button data-c="audio play">Play</button><button data-c="audio pause">Pause</button><button data-c="audio stop">Stop</button><button data-c="audio previous">Previous</button><button data-c="audio next">Next</button>
+<button data-c="volume down">Quieter</button><button data-c="volume up">Louder</button><input id="volume" aria-label="Volume" type="number" min="0" max="127" value="55"><button onclick="level('volume')">Set volume</button>
+<button data-c="volume low">Low</button><button data-c="volume normal">Normal</button><button data-c="volume high">High</button><button data-c="volume maximum">Maximum</button>
+<button data-c="mute on">Mute</button><button data-c="mute off">Unmute</button><button data-c="mute toggle">Toggle mute</button><button data-c="downmix mono">Mono</button><button data-c="downmix stereo">Stereo slots</button>
+<h2>Device</h2>
+<button onclick="fetch('/api/status').then(r=>r.text()).then(show)">Status</button><button data-c="wifi reconnect">Reconnect Wi-Fi</button><button data-c="wifi status">Wi-Fi status</button><button data-c="help">Help</button><button onclick="if(confirm('Reset controls? Wi-Fi is retained.'))run('settings reset')">Reset controls</button>
+<form onsubmit="run(this.command.value);return false"><input name="command" aria-label="Command" placeholder="effect spectrum" maxlength="95" required><button>Send</button></form>
+<pre id="result">Ready. No automatic polling.</pre>
+<p>Bluetooth UART: OTL PC Tuner BLE. Internet access needs an email/VPN gate; do not forward port 80.</p>
+<script>
+function show(t){document.getElementById('result').textContent=t}
+function run(c){fetch('/api/command',{method:'POST',body:c}).then(r=>r.text()).then(show).catch(()=>show('Connection lost; retry.'))}
+function level(n){run(n+' '+document.getElementById(n).value)}
+document.addEventListener('click',e=>{let b=e.target.closest('[data-c]');if(b)run(b.dataset.c)})
+</script></html>
