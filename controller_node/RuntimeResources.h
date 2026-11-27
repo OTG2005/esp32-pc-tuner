@@ -2,9 +2,7 @@
 #include <stddef.h>
 #include <stdint.h>
 
-// One music source and one BLE controller, not the board core's multi-client
-// defaults. All user controls remain available; phone apps must disconnect
-// before another BLE app connects.
+// Bounded resource profile shared across ESP32 PC Tuner boards.
 namespace runtime_resources {
 constexpr uint8_t BLE_CONNECTIONS = 1;
 constexpr uint8_t CLASSIC_CONNECTIONS = 1;
@@ -25,4 +23,3 @@ constexpr uint32_t MEMORY_LOG_INTERVAL_MS = 10000;
 
 void installRuntimeDiagnostics();
 void logRuntimeMemory(const char *stage);
-bool startTunerBluetoothController();

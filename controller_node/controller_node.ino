@@ -1,47 +1,44 @@
 /*
-  OTL PC Tuner - ESP32 Bluetooth speaker and sound-reactive 8x8 matrix
+  OTL PC Tuner - Board 1: Controller & Bluetooth Speaker Unit
 
-  Bluetooth audio uses one ESP32 I2S controller:
-    I2S0 TX -> MAX98357A: BCLK=26, LRC=25, DIN=22
+  Responsibilities:
+    - Bluetooth Classic A2DP audio sink -> MAX98357A I2S0 TX (BCLK=26, LRC=25, DIN=22)
+    - BLE Nordic UART Service ("OTL PC Tuner BLE") for mobile/PC commands
+    - Wi-Fi provisioning + lightweight no-login web UI (http://pc-tuner.local)
+    - Bluetooth PCM audio analysis + sound-reactive 8x8 RGB frame rendering
+      (sparkle, pulse, wave, spectrum), streamed over Wi-Fi UDP to Board 2 (LED Node)
+    - Bidirectional Wi-Fi UDP node link (port 4210) with auto-discovery, command
+      ACK/retry, and IR state sync from the LED Node (extensible to future nodes)
 
-  Bluetooth Classic A2DP carries music to the speaker. BLE remains available
-  for readable light/audio commands in BTDM (Classic + BLE) mode.
-  Wi-Fi serves lightweight, no-login controls with the same command grammar.
-  Music modes analyze the decoded A2DP PCM that is actually sent to the amp;
-  without fresh Bluetooth PCM, music effects go dark. No external audio input
-  or I2S1 receive driver is initialized.
+  No NeoPixel matrix, IR receiver, or microphone is connected to this board.
+  Keeping LED PWM power completely off this board isolates the speaker from
+  switching noise and leaves flash/RAM headroom for Wi-Fi, web, and future nodes.
 */
 
 #include <Arduino.h>
-#include <Adafruit_NeoPixel.h>
-#include <IRremote.hpp>
 
 // AudioTools must be included before ESP32-A2DP 1.8.x.
 #include "AudioTools.h"
 #include "BluetoothA2DPSink.h"
 
+#include "AudioEffects.h"
+#include "AudioSelection.h"
 #include "BleControl.h"
+#include "BluetoothResources.h"
+#include "ControlBridge.h"
+#include "ControlProtocol.h"
+#include "NodeProtocol.h"
+#include "NodeUdp.h"
+#include "RuntimeResources.h"
+#include "TunerWiFi.h"
+#include "WebControl.h"
+
 #include <atomic>
 #include <stdarg.h>
+#include <string.h>
 #include <esp32/rom/ets_sys.h>
-#include "ControlBridge.h"
-#include "IrControl.h"
-#include "AudioSelection.h"
-#include "WebControl.h"
-#include "RuntimeResources.h"
 
 // ------------------------------- Hardware ---------------------------------
-
-constexpr uint8_t IR_PIN = 34;
-
-constexpr uint8_t LED_PIN = 4;
-constexpr uint8_t MATRIX_WIDTH = 8;
-constexpr uint8_t MATRIX_HEIGHT = 8;
-constexpr uint16_t PIXEL_COUNT = MATRIX_WIDTH * MATRIX_HEIGHT;
-
-// Most 8x8 WS2812 panels use serpentine rows. Change to false for progressive
-// row wiring. Y=0 is treated as the bottom of the matrix by the effects.
-constexpr bool MATRIX_SERPENTINE = true;
 
 constexpr int SPEAKER_I2S_PORT = 0;
 constexpr int SPEAKER_BCLK_PIN = 26;
@@ -51,14 +48,7 @@ constexpr int SPEAKER_DATA_PIN = 22;
 constexpr char BLUETOOTH_NAME[] = "OTL PC Tuner";
 constexpr char BLE_CONTROL_NAME[] = "OTL PC Tuner BLE";
 
-// Nordic UART Service used by the existing phone controller.
-constexpr char SERVICE_UUID[] = "6E400001-B5A3-F393-E0A9-E50E24DCCA9E";
-constexpr char RX_UUID[] = "6E400002-B5A3-F393-E0A9-E50E24DCCA9E";
-constexpr char TX_UUID[] = "6E400003-B5A3-F393-E0A9-E50E24DCCA9E";
-
 // ------------------------------ Peripherals --------------------------------
-
-Adafruit_NeoPixel strip(PIXEL_COUNT, LED_PIN, NEO_GRB + NEO_KHZ800);
 
 I2SStream speakerOutput;
 BluetoothA2DPSink a2dpSink(speakerOutput);
@@ -73,15 +63,10 @@ bool transportTaskReady = false;
 bool firmwareReady = false;
 size_t bleHelpLine = CONTROL_HELP_COUNT;
 
-// ----------------------------- Light state ---------------------------------
+// ----------------------------- Control state -------------------------------
 
 ControlState controls;
-uint8_t &brightness = controls.brightness;
-uint8_t &currentLightMode = controls.mode;
 uint32_t controlRevision = 0;
-
-uint32_t animationTimestamp = 0;
-uint8_t animationPhase = 0;
 
 // ----------------------------- Audio meters --------------------------------
 
@@ -95,15 +80,6 @@ struct RawAudioLevels {
   uint32_t timestampMs;
 };
 
-struct DisplayAudioLevels {
-  float overall;
-  float bass;
-  float mid;
-  float treble;
-  float beat;
-  bool active;
-};
-
 // Keep this macro after the sketch's types: Arduino inserts generated function
 // prototypes at the first function, including the function inside this macro.
 SET_LOOP_TASK_STACK_SIZE(runtime_resources::LOOP_STACK_BYTES);
@@ -111,15 +87,38 @@ SET_LOOP_TASK_STACK_SIZE(runtime_resources::LOOP_STACK_BYTES);
 portMUX_TYPE audioMux = portMUX_INITIALIZER_UNLOCKED;
 RawAudioLevels bluetoothLevels = {};
 DisplayAudioLevels displayAudio = {};
-float spectrumHeights[MATRIX_WIDTH] = {};
+AudioEffectRenderer audioEffects;
 
 float audioDynamicRange = 1.0f;
 float audioFastEnvelope = 0.0f;
 float audioSlowEnvelope = 0.0f;
-float &audioSensitivity = controls.sensitivity;
 uint32_t lastAudioSequence = 0;
 uint32_t lastBeatMs = 0;
 bool audioMeterInitialized = false;
+bool clearFrameSent = true;
+
+// --------------------------- Wi-Fi LED Node Link ---------------------------
+
+struct RemoteLedNode {
+  uint32_t ipNetOrder = 0;
+  char ipText[16] = {};
+  uint8_t nodeId[6] = {};
+  uint32_t lastSeenMs = 0;
+  bool online = false;
+};
+
+struct PendingLedCommand {
+  bool active = false;
+  uint16_t sequence = 0;
+  uint8_t retriesLeft = 0;
+  uint32_t lastSentMs = 0;
+  node_protocol::LedCommandPayload payload = {};
+};
+
+RemoteLedNode ledNode;
+PendingLedCommand pendingLedCmd;
+uint16_t udpTxSequence = 0;
+uint32_t lastDiscoverMs = 0;
 
 // ----------------------------- Small helpers -------------------------------
 
@@ -129,69 +128,12 @@ float clamp01(float value) {
   return value;
 }
 
-uint16_t matrixIndex(uint8_t x, uint8_t y) {
-  if (x >= MATRIX_WIDTH || y >= MATRIX_HEIGHT) return 0;
-  if (MATRIX_SERPENTINE && (y & 1U)) {
-    x = MATRIX_WIDTH - 1U - x;
-  }
-  return static_cast<uint16_t>(y) * MATRIX_WIDTH + x;
-}
-
-void setMatrixPixel(uint8_t x, uint8_t y, uint32_t color) {
-  strip.setPixelColor(matrixIndex(x, y), color);
-}
-
-uint32_t scaleColor(uint32_t color, float scale) {
-  scale = clamp01(scale);
-  const uint8_t red = static_cast<uint8_t>(((color >> 16) & 0xFFU) * scale);
-  const uint8_t green = static_cast<uint8_t>(((color >> 8) & 0xFFU) * scale);
-  const uint8_t blue = static_cast<uint8_t>((color & 0xFFU) * scale);
-  return strip.Color(red, green, blue);
-}
-
-uint32_t colorWheel(uint8_t position) {
-  position = 255U - position;
-  if (position < 85U) {
-    return strip.Color(255U - position * 3U, 0, position * 3U);
-  }
-  if (position < 170U) {
-    position -= 85U;
-    return strip.Color(0, position * 3U, 255U - position * 3U);
-  }
-  position -= 170U;
-  return strip.Color(position * 3U, 255U - position * 3U, 0);
-}
-
-void fillStrip(uint32_t color, bool showNow = true) {
-  strip.fill(color, 0, PIXEL_COUNT);
-  if (showNow) strip.show();
-}
-
-void fadeExistingPixels(uint8_t amount) {
-  for (uint16_t index = 0; index < PIXEL_COUNT; ++index) {
-    const uint32_t color = strip.getPixelColor(index);
-    const uint8_t red = ((color >> 16) & 0xFFU) * amount / 255U;
-    const uint8_t green = ((color >> 8) & 0xFFU) * amount / 255U;
-    const uint8_t blue = (color & 0xFFU) * amount / 255U;
-    strip.setPixelColor(index, strip.Color(red, green, blue));
-  }
-}
-
-void applyLightState() {
-  strip.setBrightness(brightness);
-  if (!controls.lightsOn || brightness == 0) strip.clear();
-  else if (currentLightMode == MODE_STATIC) strip.fill(controls.color);
-  else strip.clear();
-  animationTimestamp = 0;
-  strip.show();
-}
-
-// ----------------------------- Audio capture -------------------------------
-
 uint32_t absolute32(int32_t value) {
   if (value >= 0) return static_cast<uint32_t>(value);
   return static_cast<uint32_t>(-(static_cast<int64_t>(value)));
 }
+
+// ----------------------------- Audio capture -------------------------------
 
 RawAudioLevels analyzeMonoSamples(const int32_t *samples, size_t count,
                                   int32_t &lowState, int32_t &midState,
@@ -207,8 +149,6 @@ RawAudioLevels analyzeMonoSamples(const int32_t *samples, size_t count,
 
   for (size_t index = 0; index < count; ++index) {
     const int32_t sample = samples[index];
-    // Two inexpensive one-pole filters separate approximate bass/mid/treble
-    // energy without running an FFT in the Bluetooth callback.
     lowState += (sample - lowState) / 64;
     midState += (sample - midState) / 8;
 
@@ -241,15 +181,11 @@ void onBluetoothAudio(const uint8_t *data, uint32_t length) {
   const size_t frameCount = length / (sizeof(int16_t) * 2U);
   if (frameCount == 0) return;
 
-  // A2DP delivers interleaved signed 16-bit stereo PCM. Analyze a bounded
-  // chunk so this callback never delays the I2S speaker output.
   constexpr size_t MAX_ANALYSIS_FRAMES = 512;
   const size_t step = frameCount > MAX_ANALYSIS_FRAMES
-                          ? (frameCount + MAX_ANALYSIS_FRAMES - 1U) /
-                                MAX_ANALYSIS_FRAMES
+                          ? (frameCount + MAX_ANALYSIS_FRAMES - 1U) / MAX_ANALYSIS_FRAMES
                           : 1U;
 
-  // Static storage avoids placing a 2 KB array on the Bluetooth task stack.
   static int32_t mono[MAX_ANALYSIS_FRAMES];
   size_t monoCount = 0;
   for (size_t frame = 0; frame < frameCount && monoCount < MAX_ANALYSIS_FRAMES;
@@ -286,7 +222,6 @@ void updateDisplayAudio() {
   const RawAudioLevels raw = latestAudioLevels();
   if (raw.sequence == 0U) {
     displayAudio = {};
-    memset(spectrumHeights, 0, sizeof(spectrumHeights));
     audioMeterInitialized = false;
     lastAudioSequence = 0;
     return;
@@ -318,7 +253,7 @@ void updateDisplayAudio() {
   if (audioDynamicRange < minimumRange) audioDynamicRange = minimumRange;
   if (signal > audioDynamicRange) audioDynamicRange = signal;
 
-  const float target = clamp01((signal * audioSensitivity) /
+  const float target = clamp01((signal * controls.sensitivity) /
                                (audioDynamicRange * 0.78f + 1.0f));
   const float levelRate = target > displayAudio.overall ? 0.48f : 0.10f;
   displayAudio.overall += (target - displayAudio.overall) * levelRate;
@@ -351,208 +286,189 @@ void updateDisplayAudio() {
   }
 }
 
-// ---------------------------- Light animations -----------------------------
+// --------------------------- Wi-Fi Node Link -------------------------------
 
-void renderRainbow() {
-  if (static_cast<uint32_t>(millis() - animationTimestamp) < 40U) return;
-  animationTimestamp = millis();
-  ++animationPhase;
+void queueLedStatePush() {
+  pendingLedCmd.payload.lightsOn = controls.lightsOn;
+  pendingLedCmd.payload.brightness = controls.brightness;
+  pendingLedCmd.payload.mode = controls.mode;
+  pendingLedCmd.payload.color = controls.color;
+  pendingLedCmd.payload.sensitivityX100 =
+      node_protocol::encodeSensitivity(controls.sensitivity);
+  pendingLedCmd.sequence = ++udpTxSequence;
+  pendingLedCmd.retriesLeft = node_protocol::COMMAND_MAX_RETRIES;
+  pendingLedCmd.lastSentMs = 0;
+  pendingLedCmd.active = true;
+  clearFrameSent = false;
+}
 
-  for (uint8_t y = 0; y < MATRIX_HEIGHT; ++y) {
-    for (uint8_t x = 0; x < MATRIX_WIDTH; ++x) {
-      setMatrixPixel(x, y,
-                     colorWheel(animationPhase + x * 12U + y * 8U));
-    }
+void sendLedCommandPacket() {
+  if (!ledNode.online || !node_udp::isOpen()) return;
+  uint8_t packet[node_protocol::MAX_PACKET_BYTES];
+  const size_t length = node_protocol::encodeLedCommand(
+      packet, sizeof(packet), pendingLedCmd.sequence, pendingLedCmd.payload);
+  if (length) {
+    node_udp::sendUnicast(ledNode.ipNetOrder, node_protocol::UDP_PORT, packet, length);
+    pendingLedCmd.lastSentMs = millis();
+    if (pendingLedCmd.retriesLeft > 0) --pendingLedCmd.retriesLeft;
   }
-  strip.show();
 }
 
-void renderBlink() {
-  if (static_cast<uint32_t>(millis() - animationTimestamp) < 250U) return;
-  animationTimestamp = millis();
-  static uint8_t colorIndex = 0;
-  const uint32_t colors[] = {strip.Color(255, 0, 0),
-                             strip.Color(0, 255, 0),
-                             strip.Color(0, 0, 255)};
-  fillStrip(colors[colorIndex]);
-  colorIndex = (colorIndex + 1U) % 3U;
-}
-
-void renderColorBlend() {
-  if (static_cast<uint32_t>(millis() - animationTimestamp) < 25U) return;
-  animationTimestamp = millis();
-  animationPhase += 2U;
-  fillStrip(colorWheel(animationPhase));
-}
-
-void renderFade(bool sevenColors) {
-  if (static_cast<uint32_t>(millis() - animationTimestamp) < 18U) return;
-  animationTimestamp = millis();
-
-  static uint8_t fadeValue = 0;
-  static int8_t fadeDirection = 3;
-  static uint8_t colorIndex = 0;
-  const uint32_t colors[] = {
-      strip.Color(255, 0, 0),   strip.Color(0, 255, 0),
-      strip.Color(0, 0, 255),   strip.Color(255, 255, 0),
-      strip.Color(255, 0, 255), strip.Color(0, 255, 255),
-      strip.Color(255, 255, 255)};
-  const uint8_t colorCount = sevenColors ? 7U : 3U;
-  colorIndex %= colorCount;
-
-  int nextValue = static_cast<int>(fadeValue) + fadeDirection;
-  if (nextValue >= 255) {
-    nextValue = 255;
-    fadeDirection = -3;
-  } else if (nextValue <= 0) {
-    nextValue = 0;
-    fadeDirection = 3;
-    colorIndex = (colorIndex + 1U) % colorCount;
+void sendAckToNode(uint32_t ipNetOrder, uint16_t ackedSeq,
+                   node_protocol::PacketType ackedType) {
+  if (!node_udp::isOpen()) return;
+  node_protocol::AckPayload ack;
+  ack.ackedSequence = ackedSeq;
+  ack.ackedType = ackedType;
+  ack.status = 0;
+  uint8_t packet[node_protocol::MAX_PACKET_BYTES];
+  const size_t length = node_protocol::encodeAck(
+      packet, sizeof(packet), node_protocol::NodeType::Controller,
+      ++udpTxSequence, ack);
+  if (length) {
+    node_udp::sendUnicast(ipNetOrder, node_protocol::UDP_PORT, packet, length);
   }
-  fadeValue = static_cast<uint8_t>(nextValue);
-
-  const float gammaCorrected =
-      powf(static_cast<float>(fadeValue) / 255.0f, 2.2f);
-  fillStrip(scaleColor(colors[colorIndex], gammaCorrected));
 }
 
-void renderAudioSparkle() {
-  fadeExistingPixels(188);
-  const uint8_t sparkCount =
-      static_cast<uint8_t>(displayAudio.overall * 10.0f);
-  for (uint8_t spark = 0; spark < sparkCount; ++spark) {
-    const uint16_t pixel = random(PIXEL_COUNT);
-    const uint8_t hue = animationPhase + spark * 37U;
-    const float strength =
-        0.25f + displayAudio.overall * 0.55f + displayAudio.beat * 0.20f;
-    strip.setPixelColor(pixel, scaleColor(colorWheel(hue), strength));
+void streamAudioFrameToLedNode() {
+  if (!ledNode.online || !node_udp::isOpen()) return;
+  if (!controls.lightsOn || !node_protocol::isAudioEffectMode(controls.mode)) return;
+
+  node_protocol::LedFramePayload frame;
+  const bool active = audioEffects.render(controls.mode, controls.brightness,
+                                          displayAudio, frame);
+  if (!active) {
+    if (clearFrameSent) return;
+    clearFrameSent = true;
+  } else {
+    clearFrameSent = false;
   }
-  animationPhase += 5U;
-  strip.show();
-}
 
-void renderAudioPulse() {
-  animationPhase += displayAudio.beat > 0.6f ? 13U : 2U;
-  const float intensity = clamp01(displayAudio.overall * 0.88f +
-                                  displayAudio.beat * 0.22f);
-  fillStrip(scaleColor(colorWheel(animationPhase), intensity));
-}
-
-void renderAudioWave() {
-  animationPhase += 3U;
-  strip.clear();
-
-  const float levelByRow[MATRIX_HEIGHT] = {
-      displayAudio.bass,   displayAudio.bass, displayAudio.mid,
-      displayAudio.mid,    displayAudio.mid,  displayAudio.treble,
-      displayAudio.treble, displayAudio.overall};
-
-  for (uint8_t y = 0; y < MATRIX_HEIGHT; ++y) {
-    const float width = levelByRow[y] * MATRIX_WIDTH;
-    for (uint8_t x = 0; x < MATRIX_WIDTH; ++x) {
-      const float distance = fabsf((static_cast<float>(x) + 0.5f) - 4.0f);
-      if (distance < width * 0.5f) {
-        float intensity = 0.32f + levelByRow[y] * 0.68f;
-        if (displayAudio.beat > 0.65f) intensity = 1.0f;
-        setMatrixPixel(x, y,
-                       scaleColor(colorWheel(animationPhase + y * 23U),
-                                  intensity));
-      }
-    }
+  uint8_t packet[node_protocol::MAX_PACKET_BYTES];
+  const size_t length = node_protocol::encodeLedFrame(
+      packet, sizeof(packet), ++udpTxSequence, frame);
+  if (length) {
+    node_udp::sendUnicast(ledNode.ipNetOrder, node_protocol::UDP_PORT, packet, length);
   }
-  strip.show();
 }
 
-void renderAudioSpectrum() {
-  animationPhase += displayAudio.beat > 0.55f ? 6U : 1U;
+void updateStatusSnapshot();
 
-  const float targets[MATRIX_WIDTH] = {
-      displayAudio.bass * 0.82f,
-      displayAudio.bass,
-      displayAudio.bass * 0.55f + displayAudio.mid * 0.45f,
-      displayAudio.mid,
-      displayAudio.mid * 0.85f,
-      displayAudio.mid * 0.35f + displayAudio.treble * 0.65f,
-      displayAudio.treble,
-      displayAudio.treble * 0.80f};
-
-  strip.clear();
-  for (uint8_t x = 0; x < MATRIX_WIDTH; ++x) {
-    if (targets[x] > spectrumHeights[x]) {
-      spectrumHeights[x] += (targets[x] - spectrumHeights[x]) * 0.70f;
-    } else {
-      spectrumHeights[x] *= 0.82f;
-    }
-
-    const uint8_t height = static_cast<uint8_t>(
-        constrain(static_cast<int>(spectrumHeights[x] * 9.0f), 0,
-                  static_cast<int>(MATRIX_HEIGHT)));
-    for (uint8_t y = 0; y < height; ++y) {
-      uint32_t color = colorWheel(animationPhase + x * 12U + y * 18U);
-      float intensity = 0.38f + spectrumHeights[x] * 0.62f;
-      if (displayAudio.beat > 0.72f && y == height - 1U) {
-        color = strip.Color(255, 255, 255);
-        intensity = 1.0f;
-      }
-      setMatrixPixel(x, y, scaleColor(color, intensity));
-    }
-  }
-  strip.show();
-}
-
-void updateLights() {
-  if (!controls.lightsOn || currentLightMode == MODE_STATIC) return;
-
-  const bool audioMode = currentLightMode >= MODE_AUDIO_SPARKLE;
-  const uint32_t interval = audioMode ? 30U : 0U;
-  if (interval != 0U &&
-      static_cast<uint32_t>(millis() - animationTimestamp) < interval) {
+void serviceNodeLink() {
+  if (!tuner_wifi::connected()) {
+    if (node_udp::isOpen()) node_udp::close();
+    ledNode.online = false;
     return;
   }
-  if (audioMode) {
-    animationTimestamp = millis();
-    if (!displayAudio.active) {
-      strip.clear();
-      strip.show();
-      return;
+  if (!node_udp::isOpen()) {
+    if (!node_udp::open(node_protocol::UDP_PORT)) return;
+    Serial.printf("[node-link] UDP listening on port %u\n", node_protocol::UDP_PORT);
+    lastDiscoverMs = 0;
+  }
+
+  const uint32_t now = millis();
+
+  // Receive incoming packets from LED Node (and future companion nodes).
+  uint8_t buffer[node_protocol::MAX_PACKET_BYTES];
+  uint32_t senderIp = 0;
+  uint16_t senderPort = 0;
+  for (int i = 0; i < 8; ++i) {
+    const size_t len = node_udp::receive(buffer, sizeof(buffer), senderIp, senderPort);
+    if (!len) break;
+    (void)senderPort;
+
+    node_protocol::PacketHeader header;
+    if (!node_protocol::decodeHeader(buffer, len, header)) continue;
+
+    if (header.type == node_protocol::PacketType::NodeAnnounce &&
+        header.nodeType == node_protocol::NodeType::LedMatrix) {
+      node_protocol::NodeAnnouncePayload announce;
+      if (!node_protocol::decodeNodeAnnounce(buffer, len, announce)) continue;
+      const bool newlyDiscovered = !ledNode.online || ledNode.ipNetOrder != senderIp;
+      ledNode.ipNetOrder = senderIp;
+      node_udp::formatIpv4(senderIp, ledNode.ipText);
+      memcpy(ledNode.nodeId, announce.nodeId, 6);
+      ledNode.lastSeenMs = now;
+      ledNode.online = true;
+      if (newlyDiscovered) {
+        Serial.printf("[node-link] LED Node online at %s\n", ledNode.ipText);
+        // Push controller's authoritative state to newly connected LED node.
+        queueLedStatePush();
+        updateStatusSnapshot();
+      }
+    } else if (header.type == node_protocol::PacketType::Ack &&
+               header.nodeType == node_protocol::NodeType::LedMatrix) {
+      node_protocol::AckPayload ack;
+      if (node_protocol::decodeAck(buffer, len, ack) &&
+          pendingLedCmd.active && ack.ackedSequence == pendingLedCmd.sequence) {
+        pendingLedCmd.active = false;
+      }
+      ledNode.lastSeenMs = now;
+    } else if (header.type == node_protocol::PacketType::LedStateSync &&
+               header.nodeType == node_protocol::NodeType::LedMatrix) {
+      node_protocol::LedStateSyncPayload sync;
+      if (!node_protocol::decodeLedStateSync(buffer, len, sync)) continue;
+      ledNode.ipNetOrder = senderIp;
+      node_udp::formatIpv4(senderIp, ledNode.ipText);
+      ledNode.lastSeenMs = now;
+      ledNode.online = true;
+
+      // Apply IR-originated state updates from the LED board so Web/BLE stay in sync.
+      if (sync.syncFlags & node_protocol::SYNC_FLAG_POWER)
+        controls.lightsOn = sync.lightsOn;
+      if (sync.syncFlags & node_protocol::SYNC_FLAG_BRIGHTNESS)
+        controls.brightness = sync.brightness;
+      if (sync.syncFlags & node_protocol::SYNC_FLAG_MODE)
+        controls.mode = sync.mode;
+      if (sync.syncFlags & node_protocol::SYNC_FLAG_COLOR)
+        controls.color = sync.color;
+      if (sync.syncFlags & node_protocol::SYNC_FLAG_SENSITIVITY)
+        controls.sensitivity = node_protocol::decodeSensitivity(sync.sensitivityX100);
+
+      clearFrameSent = false;
+      ++controlRevision;
+      sendAckToNode(senderIp, header.sequence, header.type);
+      updateStatusSnapshot();
+      Serial.printf("[node-link] IR sync from LED Node: lights=%s mode=%s bri=%u sens=%.2f\n",
+                    controls.lightsOn ? "on" : "off", effectName(controls.mode),
+                    controls.brightness, controls.sensitivity);
     }
   }
 
-  switch (currentLightMode) {
-    case MODE_RAINBOW:
-      renderRainbow();
-      break;
-    case MODE_BLINK:
-      renderBlink();
-      break;
-    case MODE_COLOR_BLEND:
-      renderColorBlend();
-      break;
-    case MODE_FADE_3:
-      renderFade(false);
-      break;
-    case MODE_FADE_7:
-      renderFade(true);
-      break;
-    case MODE_AUDIO_SPARKLE:
-      renderAudioSparkle();
-      break;
-    case MODE_AUDIO_PULSE:
-      renderAudioPulse();
-      break;
-    case MODE_AUDIO_WAVE:
-      renderAudioWave();
-      break;
-    case MODE_AUDIO_SPECTRUM:
-      renderAudioSpectrum();
-      break;
-    default:
-      currentLightMode = MODE_RAINBOW;
-      break;
+  // Mark LED node offline if no packets heard within timeout.
+  if (ledNode.online &&
+      static_cast<uint32_t>(now - ledNode.lastSeenMs) > node_protocol::NODE_OFFLINE_TIMEOUT_MS) {
+    ledNode.online = false;
+    Serial.println(F("[node-link] LED Node offline (timeout)"));
+    updateStatusSnapshot();
+  }
+
+  // Broadcast discovery when LED node is not yet known.
+  if (!ledNode.online &&
+      (lastDiscoverMs == 0 ||
+       static_cast<uint32_t>(now - lastDiscoverMs) >= node_protocol::ANNOUNCE_INTERVAL_MS)) {
+    uint8_t packet[node_protocol::MAX_PACKET_BYTES];
+    const size_t length = node_protocol::encodeDiscover(
+        packet, sizeof(packet), node_protocol::NodeType::Controller, ++udpTxSequence);
+    if (length) node_udp::sendBroadcast(node_protocol::UDP_PORT, packet, length);
+    lastDiscoverMs = now;
+  }
+
+  // Send or retry pending state command to LED node.
+  if (pendingLedCmd.active && ledNode.online) {
+    if (pendingLedCmd.lastSentMs == 0 ||
+        static_cast<uint32_t>(now - pendingLedCmd.lastSentMs) >=
+            node_protocol::COMMAND_RETRY_INTERVAL_MS) {
+      if (pendingLedCmd.retriesLeft > 0) {
+        sendLedCommandPacket();
+      } else {
+        pendingLedCmd.active = false;
+      }
+    }
   }
 }
 
-// ----------------------------- BLE controls --------------------------------
+// ----------------------------- BLE & Web controls --------------------------
 
 void updateStatusSnapshot() {
   DeviceStatus status;
@@ -563,6 +479,8 @@ void updateStatusSnapshot() {
       bluetoothTransportAvailable.load() && transportTaskReady;
   status.speakerReady = speakerReady;
   status.bluetoothPcmActive = displayAudio.active;
+  status.ledNodeConnected = ledNode.online;
+  strlcpy(status.ledNodeIp, ledNode.ipText, sizeof(status.ledNodeIp));
   status.level = displayAudio.overall;
   status.bass = displayAudio.bass;
   status.mid = displayAudio.mid;
@@ -595,7 +513,10 @@ ControlResult executeControl(const ControlCommand &command, bool remoteVolume = 
   ControlResult result = applyControlCommand(controls, command, playbackAvailable);
   if (!result.ok) return result;
   if (remoteVolume) controls.muted = false;
-  if (result.actions & ACTION_LIGHTS) applyLightState();
+
+  if ((result.actions & ACTION_LIGHTS) || command.kind == CommandKind::Sensitivity) {
+    queueLedStatePush();
+  }
   if ((result.actions & ACTION_VOLUME) && !remoteVolume)
     a2dpSink.set_volume(controls.muted ? 0 : controls.volume);
   if (result.actions & ACTION_DOWNMIX) a2dpSink.set_mono_downmix(controls.mono);
@@ -604,7 +525,8 @@ ControlResult executeControl(const ControlCommand &command, bool remoteVolume = 
     lastAudioSequence = 0;
     audioFastEnvelope = audioSlowEnvelope = 0;
     displayAudio = {};
-    memset(spectrumHeights, 0, sizeof(spectrumHeights));
+    audioEffects.reset();
+    clearFrameSent = false;
   }
   if ((result.actions & ACTION_WIFI_RECONNECT) && !requestWifiReconnect()) {
     result.ok = false;
@@ -634,11 +556,12 @@ void sendBleText(const char *format, ...) {
 
 void sendBleWifiStatus() {
   const WifiStatus wifi = readWifiStatus();
-  sendBleText("wifi %s; ssid %s; ip %s; signal %d dBm; setup %s; "
-      "setup-ip 192.168.4.1; hostname pc-tuner.local\n",
+  sendBleText("wifi %s; ssid %s; ip %s; signal %d dBm; led-node %s (%s); setup %s\n",
       !wifi.serviceReady ? "unavailable" : wifi.connected ? "connected" : "disconnected",
       *wifi.ssid ? wifi.ssid : "not-configured", *wifi.ip ? wifi.ip : "none",
-      wifi.rssi, wifi.setupAp ? "on" : "off");
+      wifi.rssi, ledNode.online ? "online" : "offline",
+      *ledNode.ipText ? ledNode.ipText : "none",
+      wifi.setupAp ? "on" : "off");
 }
 
 void sendBleError(const char *message) {
@@ -646,8 +569,6 @@ void sendBleError(const char *message) {
 }
 
 void processControlQueue() {
-  // The source can update volume from a Bluetooth task. Keep the latest value
-  // even if the control queue is busy, and mutate shared state only here.
   const int remoteVolume = pendingRemoteVolume.exchange(-1);
   if (remoteVolume >= 0) {
     ControlCommand volume;
@@ -735,29 +656,11 @@ void checkBleInput() {
     offset = 0;
   }
   const size_t remaining = strlen(active.message) - offset;
-  const size_t count = remaining < 20 ? remaining : 20; // Default MTU payload.
+  const size_t count = remaining < 20 ? remaining : 20;
   if (!sendBleUart(reinterpret_cast<const uint8_t *>(active.message + offset), count)) return;
   offset += count;
   lastSend = millis();
   if (offset >= strlen(active.message)) active.message[0] = '\0';
-}
-
-// ------------------------------ IR controls --------------------------------
-
-void processIrCommand(uint16_t command, bool isRepeat) {
-  ControlCommand parsed;
-  if (parseIrControl(command, isRepeat, parsed)) executeControl(parsed);
-}
-
-void checkIrInput() {
-  if (!IrReceiver.decode()) return;
-
-  const bool known = IrReceiver.decodedIRData.protocol != UNKNOWN;
-  const bool isRepeat =
-      (IrReceiver.decodedIRData.flags & IRDATA_FLAGS_IS_REPEAT) != 0U;
-  const uint16_t command = IrReceiver.decodedIRData.command;
-  IrReceiver.resume();
-  if (known) processIrCommand(command, isRepeat);
 }
 
 // ------------------------------- Audio setup -------------------------------
@@ -808,7 +711,6 @@ void setupAudio() {
   }
   logRuntimeMemory("after Bluetooth controller");
   a2dpSink.set_default_bt_mode(ESP_BT_MODE_BTDM);
-  // One MAX98357A drives one speaker, so mix both A2DP channels to mono.
   a2dpSink.set_mono_downmix(true);
   a2dpSink.set_stream_reader(onBluetoothAudio, true);
   a2dpSink.set_on_connection_state_changed(onAudioConnection);
@@ -827,8 +729,9 @@ void setup() {
   Serial.begin(115200);
   delay(100);
   installRuntimeDiagnostics();
-  Serial.println(F("OTL PC Tuner startup: testing-bluetooth-only-1"));
+  Serial.println(F("OTL PC Tuner Controller startup: dual-esp32-wifi-1"));
   logRuntimeMemory("boot");
+
   controlQueue = xQueueCreate(runtime_resources::CONTROL_QUEUE_DEPTH, sizeof(QueuedControl));
   webReplyQueue = xQueueCreate(runtime_resources::WEB_REPLY_DEPTH, sizeof(CommandReply));
   bleReplyQueue = xQueueCreate(runtime_resources::BLE_REPLY_DEPTH, sizeof(CommandReply));
@@ -839,42 +742,40 @@ void setup() {
   }
   logRuntimeMemory("after control queues");
 
-  strip.begin();
-  strip.setBrightness(brightness);
-  strip.clear();
-  strip.show();
-
-  IrReceiver.begin(IR_PIN, DISABLE_LED_FEEDBACK);
-
-  // Start A2DP in dual-mode Bluetooth before adding the BLE control service.
+  audioEffects.seed(static_cast<uint32_t>(micros()));
   setupAudio();
   if (esp_bt_controller_get_status() == ESP_BT_CONTROLLER_STATUS_ENABLED &&
-      esp_bluedroid_get_status() == ESP_BLUEDROID_STATUS_ENABLED) setupBLE();
+      esp_bluedroid_get_status() == ESP_BLUEDROID_STATUS_ENABLED) {
+    setupBLE();
+  }
   transportTaskReady = xTaskCreatePinnedToCore(
       transportTask, "pc-playback", runtime_resources::PLAYBACK_STACK_BYTES,
       nullptr, 1, nullptr, 1) == pdPASS;
-  if (!transportTaskReady) Serial.println(F("ERROR: Bluetooth playback task could not start"));
+  if (!transportTaskReady) {
+    Serial.println(F("ERROR: Bluetooth playback task could not start"));
+  }
   updateStatusSnapshot();
   setupWebControl();
 
-  randomSeed(static_cast<uint32_t>(micros()));
   firmwareReady = true;
-  Serial.println(F("Core controls initialized; network task will report HTTP/AP readiness separately."));
+  Serial.println(F("Controller ready: A2DP + BLE + Web + Wi-Fi UDP NodeLink (no LEDs/IR on this board)."));
 }
 
 void loop() {
   if (!firmwareReady) { delay(250); return; }
-  checkIrInput();
+
   processControlQueue();
   checkBleInput();
+  serviceNodeLink();
 
-  static uint32_t lastMeter = 0;
-  if (static_cast<uint32_t>(millis() - lastMeter) >= 30) {
-    lastMeter = millis();
+  static uint32_t lastFrameTick = 0;
+  if (static_cast<uint32_t>(millis() - lastFrameTick) >= 30U) {
+    lastFrameTick = millis();
     updateDisplayAudio();
+    streamAudioFrameToLedNode();
     updateStatusSnapshot();
   }
-  updateLights();
+
   static uint32_t lastMemoryLog = 0;
   if (static_cast<uint32_t>(millis() - lastMemoryLog) >=
       runtime_resources::MEMORY_LOG_INTERVAL_MS) {

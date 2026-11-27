@@ -16,6 +16,8 @@ esp_netif_t *station = nullptr;
 esp_netif_t *accessPoint = nullptr;
 bool initialized = false;
 bool started = false;
+bool coexEnabled = true;
+char deviceHostname[32] = "pc-tuner";
 char accessPointName[33] = {};
 std::atomic<bool> stationConnected{false};
 std::atomic<uint8_t> apClients{0};
@@ -66,7 +68,7 @@ bool ensureStation() {
       ets_printf("[wifi] station interface allocation failed\n");
       return false;
     }
-    esp_netif_set_hostname(station, "pc-tuner");
+    esp_netif_set_hostname(station, deviceHostname);
   }
   return true;
 }
@@ -78,7 +80,7 @@ bool ensureAccessPoint() {
       ets_printf("[wifi] setup interface allocation failed\n");
       return false;
     }
-    esp_netif_set_hostname(accessPoint, "pc-tuner");
+    esp_netif_set_hostname(accessPoint, deviceHostname);
   }
   return true;
 }
@@ -86,8 +88,9 @@ bool ensureAccessPoint() {
 bool startDriver() {
   if (started) return true;
   // ESP32's Wi-Fi binary aborts on WIFI_PS_NONE when Bluetooth is enabled.
-  // Modem sleep is also how the coexistence scheduler gives BT radio time.
-  if (!check("coexistence power-save setting", esp_wifi_set_ps(WIFI_PS_MIN_MODEM)))
+  // On Wi-Fi-only nodes (e.g. LED node), WIFI_PS_NONE minimizes UDP frame latency.
+  const wifi_ps_type_t psMode = coexEnabled ? WIFI_PS_MIN_MODEM : WIFI_PS_NONE;
+  if (!check("power-save setting", esp_wifi_set_ps(psMode)))
     return false;
   if (!check("driver start", esp_wifi_start())) return false;
   started = true;
@@ -103,8 +106,11 @@ void address(esp_netif_t *interface, char output[16]) {
 }
 }
 
-bool initialize() {
+bool initialize(const char *hostname, bool bluetoothCoex) {
   if (initialized) return true;
+  if (hostname && *hostname) strlcpy(deviceHostname, hostname, sizeof(deviceHostname));
+  coexEnabled = bluetoothCoex;
+
   if (!check("network initialization", esp_netif_init())) return false;
   const esp_err_t loop = esp_event_loop_create_default();
   if (loop != ESP_OK && loop != ESP_ERR_INVALID_STATE)
@@ -124,10 +130,10 @@ bool initialize() {
   config.rx_ba_win = 4;
   config.nvs_enable = 0; // The application stores one verified credentials blob.
   if (!check("driver initialization", esp_wifi_init(&config))) return false;
-  // Authentication/association reasons, not passwords or payload dumps.
   esp_log_level_set("wifi", ESP_LOG_INFO);
   if (!check("RAM-only driver settings", esp_wifi_set_storage(WIFI_STORAGE_RAM))) return false;
-  if (!check("coexistence initialization", esp_wifi_set_ps(WIFI_PS_MIN_MODEM))) return false;
+  const wifi_ps_type_t psMode = coexEnabled ? WIFI_PS_MIN_MODEM : WIFI_PS_NONE;
+  if (!check("power-save initialization", esp_wifi_set_ps(psMode))) return false;
   if (!check("Wi-Fi event handler",
       esp_event_handler_register(WIFI_EVENT, ESP_EVENT_ANY_ID, events, nullptr))) return false;
   if (!check("IP event handler",
@@ -172,8 +178,6 @@ bool startSetup(const char *ssid, bool stationConfigured) {
   wifi_config_t config = {};
   uint8_t mac[6] = {};
   esp_wifi_get_mac(WIFI_IF_AP, mac);
-  // A fresh, device-specific SSID avoids a phone reusing credentials cached
-  // for a previous build or connecting to another identically named ESP32.
   snprintf(accessPointName, sizeof(accessPointName), "%.27s-%02X%02X",
       ssid, mac[4], mac[5]);
   const size_t length = strlen(accessPointName);
@@ -204,5 +208,9 @@ int signalStrength() {
 }
 void stationAddress(char output[16]) { address(station, output); }
 void setupAddress(char output[16]) { address(accessPoint, output); }
+void stationMac(uint8_t mac[6]) {
+  memset(mac, 0, 6);
+  if (initialized) esp_wifi_get_mac(WIFI_IF_STA, mac);
+}
 const char *setupName() { return accessPointName; }
 }

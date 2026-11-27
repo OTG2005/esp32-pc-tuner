@@ -1,4 +1,4 @@
-"""Embed the offline web panel in ESP32 flash. No credentials are embedded here."""
+"""Embed the offline web panel into controller_node/WebPage.h. No credentials are embedded."""
 from pathlib import Path
 import gzip
 
@@ -21,8 +21,8 @@ def build() -> None:
     for offset in range(0, len(compressed), 16):
         header += "  " + ", ".join(f"0x{byte:02x}" for byte in compressed[offset:offset + 16]) + ",\n"
     header += "};\n"
-    (ROOT / "sketch_may4a" / "WebPage.h").write_text(header, encoding="utf-8", newline="\n")
-    print(f"Embedded web panel: {len(html.encode('utf-8'))} bytes; gzip: {len(compressed)} bytes")
+    (ROOT / "controller_node" / "WebPage.h").write_text(header, encoding="utf-8", newline="\n")
+    print(f"Embedded web panel into controller_node/WebPage.h: {len(html.encode('utf-8'))} bytes; gzip: {len(compressed)} bytes")
 
 
 if __name__ == "__main__":

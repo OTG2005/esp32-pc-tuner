@@ -22,6 +22,8 @@ struct DeviceStatus {
   bool playbackAvailable = false;
   bool speakerReady = false;
   bool bluetoothPcmActive = false;
+  bool ledNodeConnected = false;
+  char ledNodeIp[16] = {};
   float level = 0;
   float bass = 0;
   float mid = 0;

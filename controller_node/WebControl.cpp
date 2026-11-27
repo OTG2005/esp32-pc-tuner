@@ -25,7 +25,7 @@ WifiStatus networkStatus;
 
 void headers(httpd_req_t *req) {
   httpd_resp_set_hdr(req, "Cache-Control", "no-store");
-  httpd_resp_set_hdr(req, "X-PC-Tuner-Device", "esp32-pc-tuner");
+  httpd_resp_set_hdr(req, "X-PC-Tuner-Device", "esp32-pc-tuner-controller");
 }
 esp_err_t text(httpd_req_t *req, const char *body, const char *status = "200 OK") {
   headers(req);
@@ -34,7 +34,6 @@ esp_err_t text(httpd_req_t *req, const char *body, const char *status = "200 OK"
   return httpd_resp_send(req, body, HTTPD_RESP_USE_STRLEN);
 }
 bool body(httpd_req_t *req, char *output, size_t capacity) {
-  // Length bounds prevent buffer corruption; no session, JSON, or deep schema checks.
   if (!req->content_len || req->content_len >= capacity) {
     text(req, "Input too long or empty.", "413 Payload Too Large"); return false;
   }
@@ -90,18 +89,19 @@ esp_err_t root(httpd_req_t *req) {
     const esp_err_t result = httpd_resp_send_chunk(req,
         reinterpret_cast<const char *>(WEB_PAGE_GZIP + offset), remaining < 512 ? remaining : 512);
     if (result != ESP_OK) return result;
-    vTaskDelay(pdMS_TO_TICKS(5)); // Bound queued Wi-Fi/TCP buffers, not the audio task.
+    vTaskDelay(pdMS_TO_TICKS(5));
   }
   return httpd_resp_send_chunk(req, nullptr, 0);
 }
 esp_err_t status(httpd_req_t *req) {
   const DeviceStatus state = readDeviceStatus();
   const WifiStatus wifi = readWifiStatus();
-  char output[640];
+  char output[768];
   snprintf(output, sizeof(output),
-      "ESP32 PC Tuner\nlights=%s brightness=%u color=#%06lX effect=%s\n"
+      "ESP32 PC Tuner (Controller)\nlights=%s brightness=%u color=#%06lX effect=%s\n"
       "sensitivity=%.2f source=%s volume=%u mute=%s downmix=%s\n"
       "BT audio=%s playback=%s PCM=%s speaker=%s\n"
+      "LED node=%s IP=%s\n"
       "Wi-Fi=%s SSID=%s IP=%s RSSI=%d setup=%s\nheap=%lu uptime=%lus revision=%lu\n",
       state.controls.lightsOn ? "on" : "off", state.controls.brightness,
       static_cast<unsigned long>(state.controls.color), effectName(state.controls.mode),
@@ -109,6 +109,8 @@ esp_err_t status(httpd_req_t *req) {
       state.controls.muted ? "on" : "off", state.controls.mono ? "mono" : "stereo",
       state.bluetoothConnected ? "connected" : "off", state.bluetoothPlaying ? "playing" : "paused",
       state.bluetoothPcmActive ? "active" : "idle", state.speakerReady ? "ready" : "off",
+      state.ledNodeConnected ? "online" : "offline",
+      *state.ledNodeIp ? state.ledNodeIp : "none",
       wifi.connected ? "connected" : "off", wifi.ssid, wifi.ip, wifi.rssi,
       wifi.setupAp ? "open" : "off", static_cast<unsigned long>(state.freeHeap),
       static_cast<unsigned long>(state.uptime / 1000), static_cast<unsigned long>(state.revision));
@@ -211,7 +213,9 @@ void networkTask(void *) {
     current = WifiChange();
   bool setup = false, wasConnected = false, pendingSave = false, mdns = false;
   uint32_t attempt = millis();
-  if (!tuner_wifi::initialize()) { Serial.println(F("[wifi] driver failed")); vTaskDelete(nullptr); return; }
+  if (!tuner_wifi::initialize("pc-tuner", true)) {
+    Serial.println(F("[wifi] driver failed")); vTaskDelete(nullptr); return;
+  }
   auto openSetup = [&]() {
     if (!setup) {
       setup = tuner_wifi::startSetup(local_config::SETUP_SSID, *current.ssid != 0);
@@ -230,7 +234,7 @@ void networkTask(void *) {
   for (;;) {
     WifiChange change;
     if (xQueueReceive(wifiChanges, &change, 0) == pdTRUE) {
-      vTaskDelay(pdMS_TO_TICKS(1000)); // Let the acceptance reply leave first.
+      vTaskDelay(pdMS_TO_TICKS(1000));
       if (mdns) { mdns_free(); mdns = false; }
       tuner_wifi::disconnect(); current = change; memset(&change, 0, sizeof(change));
       pendingSave = true; wasConnected = false; wifiUpdatePending = false; connect();
@@ -245,7 +249,6 @@ void networkTask(void *) {
           Serial.println(F("[wifi] connected, but saving failed"));
         pendingSave = false;
       }
-      // User-requested lifecycle: no 60-second wait once the router has an IP.
       if (setup && tuner_wifi::stopSetup()) {
         setup = false; Serial.println(F("[wifi] router connected; open setup hotspot CLOSED"));
       }
